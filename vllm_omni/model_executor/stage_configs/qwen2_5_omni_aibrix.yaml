@@ -1,0 +1,143 @@
+# Stage config for running Qwen2.5-Omni with AIBrix KVCache (PrisKV) connector.
+#
+# This config uses AIBrixKVCacheConnector for inter-stage data transfer,
+# enabling multi-node deployment where stages run on different machines
+# connected via a shared PrisKV instance.
+#
+# Prerequisites:
+#   pip install redis   # or: pip install aibrix-kvcache
+#   # Start PrisKV / Redis on a reachable host
+#
+# Usage (single-node with remote PrisKV):
+#   python examples/offline_inference/qwen2_5_omni/end2end.py \
+#     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen2_5_omni_aibrix.yaml
+#
+# Usage (multi-node with Ray):
+#   python examples/offline_inference/qwen2_5_omni/end2end.py \
+#     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen2_5_omni_aibrix.yaml \
+#     --worker-backend ray \
+#     --ray-address auto
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: Qwen2_5OmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.8
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+    output_connectors:
+      to_stage_1: aibrix_connector
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "1"
+      max_batch_size: 1
+    engine_args:
+      model_stage: talker
+      model_arch: Qwen2_5OmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.8
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 0.8
+      top_k: 40
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.05
+      stop_token_ids: [8294]
+    input_connectors:
+      from_stage_0: aibrix_connector
+    output_connectors:
+      to_stage_2: aibrix_connector
+
+  - stage_id: 2
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "2"
+      max_batch_size: 1
+    engine_args:
+      model_stage: code2wav
+      model_arch: Qwen2_5OmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.3
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      engine_output_type: audio
+    engine_input_source: [1]
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+    input_connectors:
+      from_stage_1: aibrix_connector
+
+# Top-level runtime config
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  # AIBrix KVCache connector for cross-node communication
+  connectors:
+    aibrix_connector:
+      name: AIBrixKVCacheConnector
+      extra:
+        host: "127.0.0.1"                # PrisKV / Redis server address
+        port: 6379                        # PrisKV / Redis server port
+        # password: ""                    # Uncomment if auth required
+        pool_size: 8                      # Connection pool size
+        key_prefix: "omni"                # Key namespace
+        ttl_seconds: 300                  # Auto-expire keys after 5 min
+        retry_attempts: 40                # get() retry count
+        retry_delay_s: 0.05              # 50ms between retries
+        socket_timeout: 5.0              # Socket timeout in seconds
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
+    - from: 1
+      to: 2
+      window_size: -1

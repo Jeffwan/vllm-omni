@@ -1,0 +1,318 @@
+# ---------------------------------------------------------------------------
+# StormService: Multi-Node Omni-Modality Deployment (Qwen2.5-Omni)
+# ---------------------------------------------------------------------------
+#
+# This manifest deploys a 3-stage omni-modal pipeline using AIBrix
+# StormService across multiple Kubernetes nodes:
+#
+#   Role "thinker"  (Stage 0) — Multimodal understanding + text generation
+#   Role "talker"   (Stage 1) — Text embeddings → audio codec codes
+#   Role "code2wav" (Stage 2) — Audio codec codes → audio waveform
+#
+# Each role runs in its own Pod on potentially different nodes, communicating
+# via AIBrix KVCache (PrisKV) as the data plane.
+#
+# Prerequisites:
+#   1. AIBrix operator installed (v0.4.0+)
+#   2. PrisKV cluster running and accessible from all nodes
+#   3. Kubernetes cluster with GPU nodes
+#
+# Deploy:
+#   kubectl apply -f stormservice_qwen2_5_omni_3stage.yaml
+# ---------------------------------------------------------------------------
+
+apiVersion: orchestration.aibrix.ai/v1alpha1
+kind: StormService
+metadata:
+  name: qwen25-omni-3stage
+  labels:
+    model.aibrix.ai/name: "Qwen2.5-Omni-7B"
+    model.aibrix.ai/engine: "vllm-omni"
+  annotations:
+    # Enable AIBrix routing sidecar for inter-stage request forwarding
+    model.aibrix.ai/sidecar-injection: "true"
+spec:
+  # replicas=1 → Pooled Mode: each role scales independently
+  replicas: 1
+  stateful: true
+  updateStrategy:
+    type: InPlaceUpdate
+  selector:
+    matchLabels:
+      app: qwen25-omni-3stage
+  template:
+    metadata:
+      labels:
+        app: qwen25-omni-3stage
+        model.aibrix.ai/name: "Qwen2.5-Omni-7B"
+    spec:
+      # -----------------------------------------------------------------
+      # Three roles for the 3-stage omni-modality pipeline.
+      # StormService natively supports N roles, not just prefill/decode.
+      # -----------------------------------------------------------------
+      roles:
+        # ---------------------------------------------------------------
+        # Role 0: Thinker — multimodal understanding + text generation
+        # ---------------------------------------------------------------
+        - name: thinker
+          replicas: 1
+          stateful: true
+          labels:
+            model.aibrix.ai/port: "8000"
+            model.aibrix.ai/engine: "vllm-omni"
+            omni.vllm.ai/stage-id: "0"
+            omni.vllm.ai/stage-role: "thinker"
+          template:
+            metadata:
+              labels:
+                omni.vllm.ai/stage-role: thinker
+            spec:
+              containers:
+                - name: vllm-omni-thinker
+                  image: vllm-omni/vllm-omni:latest
+                  command: ["python", "-m", "vllm_omni.entrypoints.stage_service"]
+                  args:
+                    - "--model=Qwen/Qwen2.5-Omni-7B"
+                    - "--stage-id=0"
+                    - "--stage-type=llm"
+                    - "--model-stage=thinker"
+                    - "--model-arch=Qwen2_5OmniForConditionalGeneration"
+                    - "--gpu-memory-utilization=0.8"
+                    - "--enforce-eager"
+                    - "--trust-remote-code"
+                    - "--engine-output-type=latent"
+                    - "--port=8000"
+                    # OmniConnector config: use AIBrix KVCache for output
+                    - "--connector-type=AIBrixKVCacheConnector"
+                    - "--connector-host=$(PRISKV_HOST)"
+                    - "--connector-port=$(PRISKV_PORT)"
+                  env:
+                    - name: PRISKV_HOST
+                      value: "priskv-service.default.svc.cluster.local"
+                    - name: PRISKV_PORT
+                      value: "6379"
+                    - name: CUDA_VISIBLE_DEVICES
+                      value: "0"
+                    - name: VLLM_LOGGING_PREFIX
+                      value: "[Stage-0-Thinker]"
+                  ports:
+                    - containerPort: 8000
+                      name: http
+                    - containerPort: 9090
+                      name: metrics
+                  resources:
+                    limits:
+                      nvidia.com/gpu: "1"
+                    requests:
+                      nvidia.com/gpu: "1"
+                      cpu: "4"
+                      memory: "32Gi"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 60
+                    periodSeconds: 10
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 120
+                    periodSeconds: 30
+
+        # ---------------------------------------------------------------
+        # Role 1: Talker — text embeddings → audio codec codes
+        # ---------------------------------------------------------------
+        - name: talker
+          replicas: 1
+          stateful: true
+          labels:
+            model.aibrix.ai/port: "8001"
+            model.aibrix.ai/engine: "vllm-omni"
+            omni.vllm.ai/stage-id: "1"
+            omni.vllm.ai/stage-role: "talker"
+          template:
+            metadata:
+              labels:
+                omni.vllm.ai/stage-role: talker
+            spec:
+              containers:
+                - name: vllm-omni-talker
+                  image: vllm-omni/vllm-omni:latest
+                  command: ["python", "-m", "vllm_omni.entrypoints.stage_service"]
+                  args:
+                    - "--model=Qwen/Qwen2.5-Omni-7B"
+                    - "--stage-id=1"
+                    - "--stage-type=llm"
+                    - "--model-stage=talker"
+                    - "--model-arch=Qwen2_5OmniForConditionalGeneration"
+                    - "--gpu-memory-utilization=0.8"
+                    - "--enforce-eager"
+                    - "--trust-remote-code"
+                    - "--engine-output-type=latent"
+                    - "--engine-input-source=0"
+                    - "--port=8001"
+                    - "--connector-type=AIBrixKVCacheConnector"
+                    - "--connector-host=$(PRISKV_HOST)"
+                    - "--connector-port=$(PRISKV_PORT)"
+                  env:
+                    - name: PRISKV_HOST
+                      value: "priskv-service.default.svc.cluster.local"
+                    - name: PRISKV_PORT
+                      value: "6379"
+                    - name: CUDA_VISIBLE_DEVICES
+                      value: "0"
+                    - name: VLLM_LOGGING_PREFIX
+                      value: "[Stage-1-Talker]"
+                  ports:
+                    - containerPort: 8001
+                      name: http
+                    - containerPort: 9091
+                      name: metrics
+                  resources:
+                    limits:
+                      nvidia.com/gpu: "1"
+                    requests:
+                      nvidia.com/gpu: "1"
+                      cpu: "4"
+                      memory: "32Gi"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8001
+                    initialDelaySeconds: 60
+                    periodSeconds: 10
+
+        # ---------------------------------------------------------------
+        # Role 2: Code2Wav — audio codec codes → audio waveform
+        # ---------------------------------------------------------------
+        - name: code2wav
+          replicas: 1
+          stateful: true
+          labels:
+            model.aibrix.ai/port: "8002"
+            model.aibrix.ai/engine: "vllm-omni"
+            omni.vllm.ai/stage-id: "2"
+            omni.vllm.ai/stage-role: "code2wav"
+          template:
+            metadata:
+              labels:
+                omni.vllm.ai/stage-role: code2wav
+            spec:
+              containers:
+                - name: vllm-omni-code2wav
+                  image: vllm-omni/vllm-omni:latest
+                  command: ["python", "-m", "vllm_omni.entrypoints.stage_service"]
+                  args:
+                    - "--model=Qwen/Qwen2.5-Omni-7B"
+                    - "--stage-id=2"
+                    - "--stage-type=llm"
+                    - "--model-stage=code2wav"
+                    - "--model-arch=Qwen2_5OmniForConditionalGeneration"
+                    - "--gpu-memory-utilization=0.3"
+                    - "--enforce-eager"
+                    - "--trust-remote-code"
+                    - "--engine-output-type=audio"
+                    - "--engine-input-source=1"
+                    - "--port=8002"
+                    - "--connector-type=AIBrixKVCacheConnector"
+                    - "--connector-host=$(PRISKV_HOST)"
+                    - "--connector-port=$(PRISKV_PORT)"
+                  env:
+                    - name: PRISKV_HOST
+                      value: "priskv-service.default.svc.cluster.local"
+                    - name: PRISKV_PORT
+                      value: "6379"
+                    - name: CUDA_VISIBLE_DEVICES
+                      value: "0"
+                    - name: VLLM_LOGGING_PREFIX
+                      value: "[Stage-2-Code2Wav]"
+                  ports:
+                    - containerPort: 8002
+                      name: http
+                    - containerPort: 9092
+                      name: metrics
+                  resources:
+                    limits:
+                      nvidia.com/gpu: "1"
+                    requests:
+                      nvidia.com/gpu: "1"
+                      cpu: "4"
+                      memory: "16Gi"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8002
+                    initialDelaySeconds: 60
+                    periodSeconds: 10
+
+---
+# ---------------------------------------------------------------------------
+# PrisKV Service (data plane for inter-stage communication)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: priskv-service
+spec:
+  selector:
+    app: priskv
+  ports:
+    - port: 6379
+      targetPort: 6379
+  type: ClusterIP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: priskv
+  labels:
+    app: priskv
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: priskv
+  template:
+    metadata:
+      labels:
+        app: priskv
+    spec:
+      containers:
+        - name: priskv
+          # PrisKV is Redis-protocol compatible; use the PrisKV image
+          # or Redis as a development stand-in
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              memory: "16Gi"
+          args:
+            - "--maxmemory"
+            - "12gb"
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+
+---
+# ---------------------------------------------------------------------------
+# OmniRouter Service — lightweight request router
+# ---------------------------------------------------------------------------
+# The router receives client requests and dispatches them to Stage 0 (Thinker).
+# It polls Stage 2 (Code2Wav) for final outputs and streams them back.
+# This replaces the single-process Omni orchestrator for multi-node setups.
+apiVersion: v1
+kind: Service
+metadata:
+  name: omni-router
+spec:
+  selector:
+    omni.vllm.ai/stage-role: thinker
+  ports:
+    - port: 8080
+      targetPort: 8000
+  type: LoadBalancer

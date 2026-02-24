@@ -82,6 +82,20 @@ def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return SharedMemoryConnector(config)
 
 
+def _create_aibrix_kvcache_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.aibrix_kvcache_connector import AIBrixKVCacheConnector
+    except ImportError:
+        # Fallback import
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.aibrix_kvcache_connector import AIBrixKVCacheConnector
+    return AIBrixKVCacheConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
+OmniConnectorFactory.register_connector("AIBrixKVCacheConnector", _create_aibrix_kvcache_connector)
