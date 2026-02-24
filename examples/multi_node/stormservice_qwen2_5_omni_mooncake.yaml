@@ -1,21 +1,27 @@
 # ---------------------------------------------------------------------------
-# Step 1: StormService + MooncakeConnector (Multi-Node Omni-Modality)
+# Step 1: StormService + MooncakeConnector + ZMQ (Multi-Node Omni-Modality)
 # ---------------------------------------------------------------------------
 #
 # This manifest deploys a 3-stage omni-modal pipeline using AIBrix
-# StormService with MooncakeConnector as the data plane.
+# StormService with MooncakeConnector as the data plane and ZMQ (tcp://)
+# for lightweight task notifications between stages.
 #
 #   Role "thinker"  (Stage 0) — Multimodal understanding + text generation
 #   Role "talker"   (Stage 1) — Text embeddings → audio codec codes
 #   Role "code2wav" (Stage 2) — Audio codec codes → audio waveform
 #
-# Each role runs on its own node, communicating via Mooncake (TCP/RDMA).
+# Communication:
+#   - Data plane (heavy): MooncakeConnector (tensors, hidden states)
+#   - Control plane (light): ZMQ PUSH/PULL tcp:// (task notifications)
+#
+# Each role runs on its own node. The existing _stage_worker() loop
+# is unchanged — OmniQueue("tcp") is a drop-in for mp.Queue.
 #
 # Prerequisites:
 #   1. AIBrix operator installed (v0.4.0+)
 #   2. Mooncake master service running (see mooncake-master Deployment below)
 #   3. Kubernetes cluster with GPU nodes
-#   4. pip install mooncake-transfer-engine (baked into container image)
+#   4. pip install mooncake-transfer-engine pyzmq (baked into container image)
 #
 # Deploy:
 #   kubectl apply -f stormservice_qwen2_5_omni_mooncake.yaml
@@ -169,14 +175,26 @@ spec:
                       value: "0"
                     - name: VLLM_LOGGING_PREFIX
                       value: "[Stage-0-Thinker]"
+                    # ZMQ queue endpoints (OmniQueue transport)
+                    - name: OMNI_QUEUE_TRANSPORT
+                      value: "tcp"
+                    - name: OMNI_QUEUE_IN_ENDPOINT
+                      value: "tcp://0.0.0.0:5560"   # bind: receives tasks
+                    - name: OMNI_QUEUE_OUT_ENDPOINT
+                      value: "tcp://0.0.0.0:5561"   # bind: sends results
+                    # Next stage's in_q endpoint (for orchestrator forwarding)
+                    - name: OMNI_NEXT_STAGE_ENDPOINT
+                      value: "tcp://qwen25-omni-mooncake-talker-0:5560"
                     # Mooncake needs to know this pod's IP for registration
                     - name: POD_IP
                       valueFrom:
                         fieldRef:
                           fieldPath: status.podIP
                   ports:
-                    - containerPort: 8000
-                      name: http
+                    - containerPort: 5560
+                      name: zmq-in
+                    - containerPort: 5561
+                      name: zmq-out
                   resources:
                     limits:
                       nvidia.com/gpu: "1"
@@ -185,9 +203,8 @@ spec:
                       cpu: "4"
                       memory: "32Gi"
                   readinessProbe:
-                    httpGet:
-                      path: /health
-                      port: 8000
+                    tcpSocket:
+                      port: 5560
                     initialDelaySeconds: 120
                     periodSeconds: 10
                   securityContext:
@@ -245,13 +262,23 @@ spec:
                       value: "0"
                     - name: VLLM_LOGGING_PREFIX
                       value: "[Stage-1-Talker]"
+                    - name: OMNI_QUEUE_TRANSPORT
+                      value: "tcp"
+                    - name: OMNI_QUEUE_IN_ENDPOINT
+                      value: "tcp://0.0.0.0:5560"
+                    - name: OMNI_QUEUE_OUT_ENDPOINT
+                      value: "tcp://0.0.0.0:5561"
+                    - name: OMNI_NEXT_STAGE_ENDPOINT
+                      value: "tcp://qwen25-omni-mooncake-code2wav-0:5560"
                     - name: POD_IP
                       valueFrom:
                         fieldRef:
                           fieldPath: status.podIP
                   ports:
-                    - containerPort: 8001
-                      name: http
+                    - containerPort: 5560
+                      name: zmq-in
+                    - containerPort: 5561
+                      name: zmq-out
                   resources:
                     limits:
                       nvidia.com/gpu: "1"
@@ -260,9 +287,8 @@ spec:
                       cpu: "4"
                       memory: "32Gi"
                   readinessProbe:
-                    httpGet:
-                      path: /health
-                      port: 8001
+                    tcpSocket:
+                      port: 5560
                     initialDelaySeconds: 120
                     periodSeconds: 10
                   securityContext:
@@ -320,13 +346,22 @@ spec:
                       value: "0"
                     - name: VLLM_LOGGING_PREFIX
                       value: "[Stage-2-Code2Wav]"
+                    - name: OMNI_QUEUE_TRANSPORT
+                      value: "tcp"
+                    - name: OMNI_QUEUE_IN_ENDPOINT
+                      value: "tcp://0.0.0.0:5560"
+                    - name: OMNI_QUEUE_OUT_ENDPOINT
+                      value: "tcp://0.0.0.0:5561"
+                    # Final stage: no next stage endpoint
                     - name: POD_IP
                       valueFrom:
                         fieldRef:
                           fieldPath: status.podIP
                   ports:
-                    - containerPort: 8002
-                      name: http
+                    - containerPort: 5560
+                      name: zmq-in
+                    - containerPort: 5561
+                      name: zmq-out
                   resources:
                     limits:
                       nvidia.com/gpu: "1"
@@ -335,9 +370,8 @@ spec:
                       cpu: "4"
                       memory: "16Gi"
                   readinessProbe:
-                    httpGet:
-                      path: /health
-                      port: 8002
+                    tcpSocket:
+                      port: 5560
                     initialDelaySeconds: 120
                     periodSeconds: 10
                   securityContext:
@@ -345,20 +379,57 @@ spec:
                       add: ["IPC_LOCK"]
 
 # ===========================================================================
-# 3. OmniRouter — ingress service that routes to Stage 0 (Thinker)
+# 3. Headless Services for ZMQ pod-to-pod discovery
 # ===========================================================================
+# StormService stateful pods get stable DNS names:
+#   qwen25-omni-mooncake-thinker-0.thinker-headless.default.svc.cluster.local
+#   qwen25-omni-mooncake-talker-0.talker-headless.default.svc.cluster.local
+#   qwen25-omni-mooncake-code2wav-0.code2wav-headless.default.svc.cluster.local
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: omni-router
-  labels:
-    app: omni-router
+  name: thinker-headless
 spec:
+  clusterIP: None
   selector:
     omni.vllm.ai/stage-role: thinker
   ports:
-    - port: 8080
-      targetPort: 8000
-      name: http
-  type: LoadBalancer
+    - port: 5560
+      targetPort: 5560
+      name: zmq-in
+    - port: 5561
+      targetPort: 5561
+      name: zmq-out
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: talker-headless
+spec:
+  clusterIP: None
+  selector:
+    omni.vllm.ai/stage-role: talker
+  ports:
+    - port: 5560
+      targetPort: 5560
+      name: zmq-in
+    - port: 5561
+      targetPort: 5561
+      name: zmq-out
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: code2wav-headless
+spec:
+  clusterIP: None
+  selector:
+    omni.vllm.ai/stage-role: code2wav
+  ports:
+    - port: 5560
+      targetPort: 5560
+      name: zmq-in
+    - port: 5561
+      targetPort: 5561
+      name: zmq-out

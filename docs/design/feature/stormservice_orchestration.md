@@ -109,120 +109,90 @@ StormService provides:
 - **Placement control**: Pod anti-affinity spreads stages across nodes
 - **Stateful identity**: Stable pod names for service discovery
 
-## Implementation: The Stage Service
+## Implementation: OmniQueue (ZMQ-Based Transport)
 
-The key new component is `stage_service.py` — a standalone HTTP/gRPC service that wraps a single vLLM-Omni stage, making it independently deployable as a container.
+The core problem is that `mp.Queue` only works within a single host. Instead of
+adding a full HTTP/gRPC service layer, we replace the queue transport with
+**ZMQ PUSH/PULL sockets** via a new `OmniQueue` abstraction.
+
+ZMQ is a natural replacement because:
+- `PUSH`/`PULL` is semantically identical to `mp.Queue` (FIFO, blocking get, non-blocking get_nowait)
+- Same API for `ipc://` (single-host) and `tcp://` (cross-host) — **zero code changes** in the worker loop
+- Sub-millisecond latency (vs HTTP overhead)
+- No web server, no JSON serialization, no new framework dependencies
+- Built-in reconnection, buffering, and back-pressure (HWM)
 
 ### What Changes from the Current Architecture
 
-| Component | Current (Omni class) | New (StormService) |
+| Component | Current (Omni class) | New (StormService + ZMQ) |
 |---|---|---|
 | Process lifecycle | Orchestrator spawns/kills | Kubernetes manages pods |
-| Task dispatch | `mp.Queue.put(task)` | HTTP POST `/generate` |
-| Result collection | `mp.Queue.get()` | HTTP response / SSE stream |
-| Data plane | SharedMemory / Mooncake | PrisKV via AIBrixKVCacheConnector |
-| Control plane | In-process queue notify | HTTP callbacks / PrisKV pub/sub |
-| Health checking | Orchestrator polls queues | K8s liveness/readiness probes |
+| Task dispatch | `mp.Queue.put(task)` | `zmq.PUSH.send_pyobj(task)` |
+| Result collection | `mp.Queue.get()` | `zmq.PULL.recv_pyobj()` |
+| Data plane | SharedMemory / Mooncake | Mooncake / PrisKV (unchanged) |
+| Control plane | In-process queue | ZMQ `ipc://` or `tcp://` |
+| Health checking | Orchestrator polls queues | K8s TCP probe on ZMQ port |
 | Configuration | Single YAML, split by orchestrator | Per-stage env vars / ConfigMaps |
-| Metrics | In-band with queue results | Prometheus /metrics endpoint |
 | Scaling | Not supported | `kubectl scale` or HPA per role |
 
-### Stage Service Skeleton
+### The OmniQueue Interface
 
 ```python
-# vllm_omni/entrypoints/stage_service.py
-"""
-Standalone stage service for Kubernetes deployment.
+# vllm_omni/distributed/omni_queue.py
 
-Each stage runs as an independent HTTP service. Stages communicate
-via OmniConnectors (PrisKV) for heavy data and HTTP callbacks for
-lightweight notifications.
+class OmniQueue(ABC):
+    """Drop-in replacement for mp.Queue that supports multiple transports."""
 
-Usage:
-    python -m vllm_omni.entrypoints.stage_service \
-        --model Qwen/Qwen2.5-Omni-7B \
-        --stage-id 0 \
-        --stage-type llm \
-        --model-stage thinker \
-        --connector-type AIBrixKVCacheConnector \
-        --connector-host priskv-service \
-        --connector-port 6379 \
-        --port 8000
-"""
+    def put(self, obj): ...
+    def get(self, timeout=None): ...
+    def get_nowait(self): ...      # raises queue.Empty
+    def empty(self) -> bool: ...
+    def close(self): ...
 
-from fastapi import FastAPI
-from pydantic import BaseModel
-
-app = FastAPI()
-
-class GenerateRequest(BaseModel):
-    request_id: str
-    engine_inputs: dict      # For stage-0: prompt + multimodal data
-    sampling_params: dict    # Stage-specific sampling params
-    from_connector: bool = False  # True if inputs are in PrisKV
-
-class GenerateResponse(BaseModel):
-    request_id: str
-    status: str              # "completed" | "forwarded" | "error"
-    outputs: dict | None     # Final outputs (if final_output stage)
-    metrics: dict | None
-
-@app.post("/generate")
-async def generate(req: GenerateRequest) -> GenerateResponse:
-    """
-    Process a generation request for this stage.
-
-    Flow:
-    1. If from_connector: fetch inputs from PrisKV
-    2. Run engine.generate()
-    3. If not final_output: store results in PrisKV, notify next stage
-    4. If final_output: return results directly
-    """
-    # 1. Resolve inputs
-    if req.from_connector:
-        inputs, _ = connector.get(
-            from_stage=req.from_stage,
-            to_stage=str(STAGE_ID),
-            request_id=req.request_id
-        )
-    else:
-        inputs = req.engine_inputs
-
-    # 2. Generate
-    outputs = await engine.generate(inputs, req.sampling_params)
-
-    # 3. Forward or return
-    if not FINAL_OUTPUT:
-        connector.put(
-            from_stage=str(STAGE_ID),
-            to_stage=str(NEXT_STAGE_ID),
-            request_id=req.request_id,
-            data={"engine_inputs": processed_outputs}
-        )
-        # Notify next stage via HTTP
-        await notify_next_stage(req.request_id)
-        return GenerateResponse(
-            request_id=req.request_id,
-            status="forwarded"
-        )
-    else:
-        return GenerateResponse(
-            request_id=req.request_id,
-            status="completed",
-            outputs=serialize_outputs(outputs)
-        )
-
-@app.get("/health")
-async def health():
-    """Kubernetes health probe endpoint."""
-    return {
-        "status": "healthy",
-        "stage_id": STAGE_ID,
-        "connector": connector.health()
-    }
+    @staticmethod
+    def create(transport, *, endpoint=None, bind=False) -> "OmniQueue":
+        """
+        transport="mp"   → MPQueue (wraps mp.Queue, backward compatible)
+        transport="ipc"  → ZMQQueue("ipc:///tmp/omni-stage-0-in")
+        transport="tcp"  → ZMQQueue("tcp://stage-1-pod:5560")
+        """
 ```
 
-### Request Flow in StormService Deployment
+### Code Change in Stage Worker: Minimal
+
+The existing `_stage_worker()` loop changes by exactly **zero lines**. It
+already calls `in_q.get()`, `in_q.get_nowait()`, `in_q.empty()`, and
+`out_q.put()` — all of which `OmniQueue` implements.
+
+The only change is in the orchestrator's `_start_stages()` method, which
+swaps `mp.Queue()` for `OmniQueue.create(...)`:
+
+```python
+# Before:
+in_q = self._ctx.Queue(maxsize=0)      # mp.Queue (local only)
+
+# After (single-node, backward compatible):
+in_q = OmniQueue.create("ipc", endpoint=f"ipc:///tmp/omni-stage-{stage_id}-in", bind=True)
+
+# After (multi-node, cross-host):
+in_q = OmniQueue.create("tcp", endpoint=f"tcp://0.0.0.0:{5560 + stage_id}", bind=True)
+```
+
+### Transport Comparison
+
+```
+              mp.Queue         ZMQ ipc://         ZMQ tcp://
+              ────────         ──────────         ──────────
+scope         same process     same host          cross-host
+latency       ~10-50µs         ~5-20µs            ~50-200µs
+serialization pickle           pickle             pickle
+max msg size  limited by RAM   limited by RAM     limited by RAM
+reconnect     N/A              N/A                automatic
+back-pressure blocks           HWM (configurable) HWM (configurable)
+new deps      none             pyzmq              pyzmq
+```
+
+### Request Flow in StormService Deployment (ZMQ)
 
 ```
 Client
@@ -230,46 +200,53 @@ Client
   ├─── POST /v1/chat/completions ───► OmniRouter (K8s Service)
   │                                        │
   │                                        ▼
-  │                              POST /generate ───► Thinker Pod (Stage 0)
+  │                     zmq.PUSH (tcp://) ───► Thinker Pod (Stage 0)
+  │                                               │  task = in_q.get()
+  │                                               ├─ engine.generate()
+  │                                               ├─ connector.put() → Mooncake
+  │                                               └─ out_q.put(result)
   │                                                      │
-  │                                                      ├─ engine.generate()
-  │                                                      ├─ connector.put() → PrisKV
-  │                                                      └─ POST /generate → Talker Pod
-  │                                                                             │
-  │                                                      ┌──────────────────────┘
+  │                     zmq.PUSH (tcp://) ◄──────────────┘
+  │                            │
+  │                            ▼
+  │                     zmq.PUSH (tcp://) ───► Talker Pod (Stage 1)
+  │                                               │  task = in_q.get()
+  │                                               ├─ connector.get() ← Mooncake
+  │                                               ├─ engine.generate()
+  │                                               ├─ connector.put() → Mooncake
+  │                                               └─ out_q.put(result)
   │                                                      │
-  │                                                      ├─ connector.get() ← PrisKV
-  │                                                      ├─ engine.generate()
-  │                                                      ├─ connector.put() → PrisKV
-  │                                                      └─ POST /generate → Code2Wav Pod
-  │                                                                             │
-  │                                                      ┌──────────────────────┘
+  │                     zmq.PUSH (tcp://) ◄──────────────┘
+  │                            │
+  │                            ▼
+  │                     zmq.PUSH (tcp://) ───► Code2Wav Pod (Stage 2)
+  │                                               │  task = in_q.get()
+  │                                               ├─ connector.get() ← Mooncake
+  │                                               ├─ engine.generate()
+  │                                               └─ out_q.put(audio_output)
   │                                                      │
-  │                                                      ├─ connector.get() ← PrisKV
-  │                                                      ├─ engine.generate()
-  │                                                      └─ Return audio output
-  │                                                              │
-  │◄──── SSE stream / JSON response ────────────────────────────┘
+  │◄───── zmq.PUSH (tcp://) ◄───────────────────────────┘
 ```
 
 ## Can We Implement a Different Orchestrator?
 
 **Yes.** The current orchestrator is not fundamental to vLLM-Omni — it's a convenience layer. Here are the viable alternatives:
 
-### Option 1: StormService (Recommended for Production)
+### Option 1: StormService + ZMQ (Recommended for Production)
 
 **Pros:**
 - Battle-tested Kubernetes operator from AIBrix
 - Built-in rolling updates, scaling, health management
 - Supports N roles (not just 2)
 - Works with any OmniConnector backend
+- ZMQ replaces mp.Queue with zero changes to stage worker code
+- Same ZMQ API for single-host (ipc://) and multi-node (tcp://)
 
 **Cons:**
 - Requires Kubernetes
-- Requires new `stage_service.py` entrypoint
-- Control plane moves from in-process queues to HTTP/gRPC
+- Requires pyzmq dependency
 
-**Implementation effort:** Medium — StormService CRD already exists; need `stage_service.py` + OmniRouter
+**Implementation effort:** Low — OmniQueue is a drop-in; StormService CRD already exists
 
 ### Option 2: Ray Serve
 
@@ -308,35 +285,37 @@ Client
                     │                                   │
                     │  Development / Single Node:       │
                     │    → Current Omni orchestrator    │
-                    │    → mp.Queue + SharedMemory      │
+                    │    → OmniQueue("mp") or ("ipc")  │
+                    │    → SharedMemoryConnector        │
                     │                                   │
                     │  Multi-Node / Ray Cluster:        │
                     │    → Ray backend (fix SPREAD)     │
-                    │    → AIBrixKVCacheConnector        │
+                    │    → MooncakeConnector             │
                     │                                   │
                     │  Production / Kubernetes:         │
                     │    → StormService orchestrator    │
-                    │    → stage_service.py per pod     │
-                    │    → AIBrixKVCacheConnector        │
+                    │    → OmniQueue("tcp")             │
+                    │    → MooncakeConnector / PrisKV    │
                     │                                   │
                     └───────────────────────────────────┘
 ```
 
-The key insight is that the **OmniConnector abstraction already decouples data transfer from orchestration**. By adding `stage_service.py` (HTTP wrapper around the existing `_stage_worker` loop), any orchestrator can drive the pipeline — the stages don't care whether tasks come from `mp.Queue`, Ray, or HTTP.
+The key insight is that the **OmniConnector abstraction already decouples data transfer from orchestration**. By replacing `mp.Queue` with `OmniQueue` (ZMQ-backed), any orchestrator can drive the pipeline — the worker loop is literally unchanged; only the transport URL changes from `ipc://` to `tcp://`.
 
 ## Implementation Roadmap (Two-Step Approach)
 
-### Step 1: Multi-Modality Orchestration with StormService + Mooncake
+### Step 1: OmniQueue + StormService + MooncakeConnector
 
-Use the **existing MooncakeConnector** as the data plane first. This avoids introducing a new connector and focuses on solving the orchestration problem.
+Replace `mp.Queue` with `OmniQueue` (ZMQ) and use **MooncakeConnector** as the data plane.
 
-- [ ] `stage_service.py` — FastAPI wrapper for stage worker
-- [ ] Health endpoint (`/health`), Generate endpoint (`/generate`), Metrics endpoint (`/metrics`)
-- [ ] StormService YAML with 3 roles (thinker/talker/code2wav) using MooncakeConnector
-- [ ] OmniRouter service for request ingress
-- [ ] Dockerfile for stage service
+- [x] `OmniQueue` abstraction — MPQueue, ZMQQueue (ipc:// + tcp://)
+- [x] Unit tests for OmniQueue (mp, ipc, tcp transports)
+- [x] StormService YAML with 3 roles (thinker/talker/code2wav) using MooncakeConnector
+- [ ] Wire `OmniQueue` into `Omni._start_stages()` and `OmniStage.attach_queues()`
+- [ ] OmniRouter service for request ingress (lightweight ZMQ → ZMQ forwarder)
+- [ ] Dockerfile for stage worker (existing `_stage_worker` + OmniQueue tcp://)
 - [ ] Extend AIBrix Gateway Plugin for multi-stage routing (beyond P/D)
-- [ ] E2E test: 3-node deployment with StormService + Mooncake
+- [ ] E2E test: 3-node deployment with StormService + Mooncake + ZMQ
 
 ### Step 2: Replace Mooncake with PrisKV / AIBrix Connector
 
