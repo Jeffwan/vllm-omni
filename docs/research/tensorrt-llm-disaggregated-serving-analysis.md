@@ -459,34 +459,114 @@ MessagePack 序列化（紧凑二进制编码）
 ### 5.1 分层存储架构
 
 ```
-GPU HBM（最快，最贵）
-    │
-    ▼
-CPU Host RAM
-    │
-    ▼
-本地 SSD
-    │
-    ▼
-远程/云对象存储（最便宜，最慢）
+G1: GPU HBM        ← ns 级访问，最高性能
+├── 活跃 KV blocks（token 生成中使用）
+
+G2: System RAM      ← us 级访问，暂存/缓冲
+├── HBM 溢出的 KV blocks，跨节点 CPU 共享
+
+G3: 本地/池化 SSD   ← sub-ms 级访问，温热复用
+├── 短时间尺度上复用的 KV blocks
+
+G3.5: ICMS (BlueField-4) ← 机架内上下文内存
+├── 连接 pod 内与 pod 外存储
+
+G4: 远程存储         ← ms 级访问，冷/共享
+├── 持久化产物，视为不透明 blob 存储
 ```
 
 KVBM 的驱逐策略将旧的或访问频率低的 blocks 逐层下移，可在整个数据中心管理潜在的 PB 级 KV cache。
 
-### 5.2 NIXL 传输层
+### 5.2 TRT-LLM KV Cache Block 管理
 
-NIXL 提供统一传输抽象：
+**Block 内存布局**:
+```
+Block shape: [num_blocks, 2, tokens_per_block, num_kv_heads, head_dim]
+                        K/V
+```
 
-| 传输方式 | 说明 |
-|----------|------|
-| NVLink (C2C, NVSwitch) | 同节点 GPU 间直连 |
-| InfiniBand / RoCE | 跨节点 RDMA |
-| PCIe / Ethernet | 通用网络 |
-| GPUDirect Storage | GPU 直接访问存储 |
-| UCX | 统一通信 |
-| S3 | 云对象存储 |
+Blocks 组织在 **Radix Search Tree** 中用于跨请求的前缀匹配复用检测。系统实现**优先级 LRU 驱逐**: blocks 获得优先级分数（0-100），同一优先级的所有 blocks 必须先驱逐，才会驱逐下一优先级。
 
-自动通过 "通用内存段" 选择最优数据路径。
+**Offloading 配置**:
+- `host_cache_size`: CPU 内存预算（字节，默认 0）
+- `secondary_offload_min_priority`: 阈值（默认 35，范围 0-100），低于此值的 blocks 直接驱逐而非 offload
+- `free_gpu_memory_fraction`: GPU 内存用于 KV cache 的比例（默认 0.9）
+
+> **硬件兼容性**: Grace-Hopper 系统上 offloading 开销可忽略（NVLink-C2C），x86+Hopper 可管理，pre-Hopper 因 PCIe 带宽限制不推荐。
+
+**KVBM Block 生命周期**:
+```
+                 init_sequence(salt_hash)
+    [Reset] ────────────────────────────→ [Partial]
+      ↑                                       │
+      │                                       │ commit()
+      │  drop() (RAII)                        ▼
+      ├──────────────────────────────── [Complete]
+      ↑                                       │
+      │                                       │ register()
+      │  drop() (RAII)                        ▼
+      └──────────────────────────────── [Registered]
+```
+
+**存储后端**: `DeviceStorage`（GPU）、`PinnedStorage`（pinned CPU）、`SystemStorage`（pageable CPU）、`NixlStorage`（远程/RDMA 注册）。
+
+### 5.3 NIXL 传输层详解
+
+NIXL Agent 架构:
+
+```
++-------------------+                    +-------------------+
+|   NIXL AGENT      |   ← metadata →    |   NIXL AGENT      |
+|   (Worker 1)      |     exchange       |   (Worker 2)      |
+|                    |                    |                    |
+| +───────────────+ |                    | +───────────────+ |
+| │ Memory        │ |                    | │ Memory        │ |
+| │ Sections      │ |                    | │ Sections      │ |
+| │ - VRAM (HBM)  │ |                    | │ - VRAM (HBM)  │ |
+| │ - DRAM (CPU)  │ |                    | │ - DRAM (CPU)  │ |
+| │ - NVMe        │ |                    | │ - NVMe        │ |
+| │ - Obj Store   │ |                    | │ - Obj Store   │ |
+| +───────────────+ |                    | +───────────────+ |
+|        │          |                    |        │          |
+| +───────────────+ |                    | +───────────────+ |
+| │ Backend       │ |                    | │ Backend       │ |
+| │ Plugins       │ |                    | │ Plugins       │ |
+| │ - UCX (RDMA)  │ |                    | │ - UCX (RDMA)  │ |
+| │ - GDS         │ |                    | │ - GDS         │ |
+| │ - S3          │ |                    | │ - S3          │ |
+| +───────────────+ |                    | +───────────────+ |
++-------------------+                    +-------------------+
+```
+
+**NIXL API 生命周期**:
+1. **初始化**: 创建 agent，初始化后端插件
+2. **内存注册**: `nixl_register()` 注册内存段，生成安全密钥
+3. **元数据交换**: 通过 side-channel（TCP socket 或 etcd）导出/导入元数据
+4. **传输执行**:
+   - `createXferReq()` → 创建传输请求
+   - `postXferReq()` → 发起异步非阻塞传输
+   - `getXferStatus()` → 轮询完成状态
+   - `releaseXferReq()` → 清理
+5. **动态扩缩**: 通过元数据交换/失效添加/移除 agents
+
+**传输协议性能对比**:
+
+| 协议 | 适用场景 | 带宽 | SM 占用 |
+|------|----------|------|---------|
+| RDMA (InfiniBand/RoCE) | 跨节点 GPU-to-GPU | ~50 GB/s/link | 零 (GPUDirect RDMA) |
+| NVLink (C2C/NVSwitch) | 同节点 GPU-to-GPU | 最高带宽 | 零 |
+| UCX | TRT-LLM disagg 默认 | 好，支持动态扩缩 | 极少 |
+| GPUDirect Storage | GPU-to-NVMe | 高，绕过 CPU | 零 |
+| TCP/Ethernet | 无 RDMA 时回退 | 较低 | CPU 密集 |
+| AWS EFA | 云 RDMA 等价 | 好 | 极少 |
+
+**NIXL vs NCCL（关键差异）**:
+- 在典型 KV cache 传输大小（256KB - 1MB blocks）下，NIXL 比 NCCL 快 **30-50%**
+- NIXL 是 **SM-free** 的，不消耗 GPU 计算资源；NCCL 即使 P2P send/recv 也需要启动 GPU kernel
+- NCCL 为集合通信（all-reduce、all-gather）优化，不适合点对点推理传输
+- 在 >10MB 时 NCCL 追平或略超 NIXL
+
+> **为何不用 NCCL**: KV cache 传输是小块（256KB-1MB）、高频、点对点的模式，NIXL 的 SM-free 特性意味着传输期间所有 SM 都可用于推理计算。
 
 ### 5.3 KV Cache Transfer 后端对比
 
@@ -536,9 +616,34 @@ TRT-LLM 的 KV Cache Connector API 提供状态传输的抽象层：
 - 重叠优化: 一个请求发送/接收 KV blocks 时，其他请求继续计算
 - 多 GPU 并行: 不同 GPU 组间的 KV cache 传输并行执行
 
-### 5.7 计划中的增强：层级异步传输（GitHub issue #9212）
+### 5.7 计算与通信重叠
 
-不再等待完整 prefill 完成后才传输 KV cache，而是**每层 KV cache 计算完成后立即传输**。这将把有效 TTFT 降至仅 prefill 计算时间加上最后一层的传输时间。
+**请求级重叠（当前实现）**:
+```
+Time ──────────────────────────────────────────────>
+
+GPU 0:  [Prefill Req A] [Transfer KV A ──────>]
+GPU 0:                   [Prefill Req B] [Transfer KV B ──>]
+GPU 1:  [Decode Req X]  [<── Receive KV A] [Decode Req A]
+```
+一个请求的 KV cache 传输期间，batch 中其他请求继续 forward pass。多 GPU 实例的不同 GPU 对间传输并行执行。
+
+### 5.8 层级异步传输（GitHub issue #9212）
+
+不再等待完整 prefill 完成后才传输 KV cache，而是**每层 KV cache 计算完成后立即传输**：
+
+```
+当前:   TTFT = Prefill_time + Full_KV_transfer_time
+
+提案:   TTFT ≈ Prefill_time + Last_layer_KV_transfer_time
+
+逐层重叠:
+  计算 Layer 1  ──→ 传输 Layer 1 KV ──────────→
+                 计算 Layer 2  ──→ 传输 Layer 2 KV ──→
+                                计算 Layer 3  ──→ ...
+```
+
+**实测结果（Qwen3-32B，TP4，Ethernet）**: 逐层异步传输 **32ms** vs 传统批量传输 **265ms**，8x+ 加速。
 
 ### 5.8 性能基准（DeepSeek R1 on GB200）
 
