@@ -608,15 +608,117 @@ DYN_KVBM_DISK_CACHE_GB=20
 
 构建: `./container/build.sh --framework trtllm --enable-kvbm`
 
-### 5.7 KV Cache Connector API（TRT-LLM 内部）
+### 5.7 KV Cache Connector API（TRT-LLM v1.1+）
 
-TRT-LLM 的 KV Cache Connector API 提供状态传输的抽象层：
-- KV cache 交换模块与 KV cache manager 和底层通信库**模块化解耦**
-- 职责: 高效收发 cache、及时释放 cache 空间、交换过程中 cache 布局转换
-- 重叠优化: 一个请求发送/接收 KV blocks 时，其他请求继续计算
-- 多 GPU 并行: 不同 GPU 组间的 KV cache 传输并行执行
+TRT-LLM 的 KV Cache Connector API（[文档](https://nvidia.github.io/TensorRT-LLM/features/kv-cache-connector.html)）提供正式的可扩展接口，允许自定义 KV cache 存储后端。采用 **Scheduler/Worker 双组件设计**。
 
-### 5.8 计算与通信重叠
+**Scheduler 接口（`KvCacheConnectorScheduler`，仅 rank 0 运行）**:
+
+| 方法 | 签名 | 用途 |
+|------|------|------|
+| `build_connector_meta` | `(scheduler_output: SchedulerOutput) -> object` | 核心方法：检查请求，返回可 pickle 元数据，广播到所有 workers |
+| `get_num_new_matched_tokens` | `(request: LlmRequest, num_computed_tokens: int) -> tuple[int, bool]` | 检查外部 KV cache 是否存在，返回匹配 token 数 + 是否异步 |
+| `request_finished` | `(request: LlmRequest, cache_block_ids: list[int]) -> bool` | 请求完成回调，返回是否有挂起的异步保存 |
+| `update_state_after_alloc` | `(request: LlmRequest, block_ids: list[int])` | Block 分配后更新内部状态 |
+
+**Worker 接口（`KvCacheConnectorWorker`，所有 rank 运行）**:
+
+| 方法 | 签名 | 用途 |
+|------|------|------|
+| `register_kv_caches` | `(kv_cache_tensor: torch.Tensor)` | 初始化时接收 GPU KV cache 张量引用 |
+| `start_load_kv` | `(stream: torch.cuda.Stream)` | 发起从外部存储加载 KV blocks |
+| `wait_for_layer_load` | `(layer_idx: int, stream: torch.cuda.Stream)` | 逐层同步点，在 forward pass 前等待加载完成 |
+| `save_kv_layer` | `(layer_idx: int, stream: torch.cuda.Stream)` | 触发保存特定层的 KV cache |
+| `wait_for_save` | `(stream: torch.cuda.Stream)` | 确保所有保存操作完成 |
+| `get_finished` | `(finished_gen_req_ids, started_loading_req_ids) -> tuple[list, list]` | 轮询异步操作状态 |
+
+**YAML 配置自定义 Connector**:
+```yaml
+kv_connector_config:
+  connector_module: my_package.my_connector_module      # Python 模块路径
+  connector_scheduler_class: MyConnectorScheduler       # Scheduler 类名
+  connector_worker_class: MyConnectorWorker             # Worker 类名
+```
+
+> 参考示例：`examples/llm-api/llm_kv_cache_connector.py`，实现文件系统 `.pt` 文件保存/加载。
+
+**三种典型用例**:
+1. **KV Cache Offloading** — 将 blocks 移到更廉价存储（CPU RAM、NVMe、网络）
+2. **Disaggregated Serving** — 在 prefill 和 decode 实例间传输
+3. **KV Cache Sharing** — 模型实例间点对点 cache 传输
+
+**Dynamo KVBM Connector 配置**（使用 Connector API 的具体实现）:
+```yaml
+kv_connector_config:
+  connector_module: kvbm.trtllm_integration.connector
+  connector_scheduler_class: DynamoKVBMConnectorLeader
+  connector_worker_class: DynamoKVBMConnectorWorker
+kv_cache_config:
+  enable_partial_reuse: false
+  free_gpu_memory_fraction: 0.80
+```
+
+### 5.8 TRT-LLM Disagg 传输后端详细配置
+
+TRT-LLM disaggregated serving 使用 `cache_transceiver_config`（独立于 Connector API）配置传输后端：
+
+```yaml
+cache_transceiver_config:
+  backend: NIXL    # 可选: NIXL (默认), UCX, MPI, DEFAULT, LIBFABRIC
+  max_tokens_in_buffer: 2048
+```
+
+| 后端 | 状态 | 说明 |
+|------|------|------|
+| **NIXL** | 默认（v0.21.0+） | 推荐；支持动态扩缩；通过 `TRTLLM_NIXL_KVCACHE_BACKEND=UCX\|LIBFABRIC` 选底层 |
+| **UCX** | 支持 | 推荐；GPU 容器预装；支持动态扩缩 |
+| **MPI** | 已弃用 | 仅静态部署 |
+| **LIBFABRIC** | 支持（v0.16.0+） | AWS EFA 环境 |
+| **Mooncake** | 已集成（2025-12） | Mooncake Transfer Engine，用于 PD-disagg |
+
+**传输调优环境变量**:
+
+| 变量 | 默认值 | 用途 |
+|------|--------|------|
+| `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP` | `0` | 禁用与推理的重叠 |
+| `TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL` | `0` | 从多 rank 并行接收 |
+| `TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER` | `0` | 零拷贝直传（无缓冲） |
+| `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` | `512MB` | 临时缓冲区大小 |
+| `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM` | `1` | 最大并发发送数 |
+
+### 5.9 KVBM 分层 Offloading 完整配置
+
+**环境变量**:
+
+| 变量 | 用途 |
+|------|------|
+| `DYN_KVBM_CPU_CACHE_GB` | CPU pinned 内存预算（如 `4` = 4GB） |
+| `DYN_KVBM_DISK_CACHE_GB` | 本地 SSD NVMe 预算（如 `8` = 8GB） |
+| `DYN_KVBM_CPU_CACHE_OVERRIDE_NUM_BLOCKS` | 精确 CPU block 数（替代 GB） |
+| `DYN_KVBM_DISK_CACHE_OVERRIDE_NUM_BLOCKS` | 精确 disk block 数 |
+| `DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER` | 禁用频率过滤的 disk offload |
+| `DYN_KVBM_DISK_ZEROFILL_FALLBACK` | fallocate 不支持时的回退 |
+| `DYN_KVBM_METRICS` | 启用 metrics |
+| `DYN_KVBM_METRICS_PORT` | Metrics 端口（默认 6880） |
+| `DYN_KVBM_LEADER_WORKER_INIT_TIMEOUT_SECS` | 初始化超时（如 `1200`） |
+
+**支持的 tier 组合**:
+- **CPU only**: `DYN_KVBM_CPU_CACHE_GB=4`
+- **CPU + Disk**: `DYN_KVBM_CPU_CACHE_GB=4` + `DYN_KVBM_DISK_CACHE_GB=8`
+- **Disk only**（实验性）: `DYN_KVBM_DISK_CACHE_GB=8`（绕过 CPU tier）
+
+**KVBM Rust 存储后端**:
+
+| 类型 | Tier | 描述 |
+|------|------|------|
+| `DeviceStorage` | G1 | GPU HBM；CUDA device buffers；主分配目标 |
+| `PinnedStorage` | G2 | Pinned（page-locked）主机 CPU 内存；高效 CUDA D2H |
+| `SystemStorage` | — | Pageable CPU heap；回退/测试用 |
+| `NixlStorage` | G3/G4 | 远程内存 via NIXL RDMA handles；含磁盘和远程存储 |
+
+数据流路径: Device → Host (CUDA D2H copy) → Disk (NIXL Write, 可选 GDS) → Remote (NIXL G4 opaque blob store)。
+
+### 5.10 计算与通信重叠
 
 **请求级重叠（当前实现）**:
 ```
@@ -628,7 +730,7 @@ GPU 1:  [Decode Req X]  [<── Receive KV A] [Decode Req A]
 ```
 一个请求的 KV cache 传输期间，batch 中其他请求继续 forward pass。多 GPU 实例的不同 GPU 对间传输并行执行。
 
-### 5.9 层级异步传输（GitHub issue #9212）
+### 5.11 层级异步传输（GitHub issue #9212）
 
 不再等待完整 prefill 完成后才传输 KV cache，而是**每层 KV cache 计算完成后立即传输**：
 
@@ -645,7 +747,7 @@ GPU 1:  [Decode Req X]  [<── Receive KV A] [Decode Req A]
 
 **实测结果（Qwen3-32B，TP4，Ethernet）**: 逐层异步传输 **32ms** vs 传统批量传输 **265ms**，8x+ 加速。
 
-### 5.10 性能基准（DeepSeek R1 on GB200）
+### 5.12 性能基准（DeepSeek R1 on GB200）
 
 | 配置 | ISL/OSL | 加速比 |
 |------|---------|--------|
@@ -653,6 +755,51 @@ GPU 1:  [Decode Req X]  [<── Receive KV A] [Decode Req A]
 | + MTP | 4400/1200 | 1.6x-2.5x |
 | 标准 disagg | 8192/256 | 2x（8-GPU） |
 | 标准 disagg | 4096/1024 | 1.7x @ 50 tokens/sec/user |
+
+### 5.13 与 LMCache / Mooncake 对比
+
+#### LMCache 扩展模型
+
+LMCache（[文档](https://docs.lmcache.ai/developer_guide/extending_lmcache/index.html)）提供四种扩展框架：
+
+1. **Storage Plugin Framework** — 实现 `StoragePluginInterface`（继承自 `StorageBackendInterface`）
+2. **Remote Storage Plugin Framework** — 实现 `ConnectorAdapter` + `RemoteConnector` 子类
+3. **Runtime Plugin Framework** — 自定义脚本作为独立进程
+4. **Configurable Storage Backend** — 实现 `ConfigurableStorageBackendInterface`
+
+`StorageBackendInterface` 核心方法: `contains()`, `batched_submit_put_task()`, `get_blocking()`, `get_non_blocking()`, `batched_get_blocking()`, `pin()`, `unpin()`, `remove()`, `submit_prefetch_task()`。
+
+配置方式:
+```yaml
+storage_plugins: ["my_custom_storage"]
+extra_config:
+  storage_plugin.my_custom_storage.module_path: my_package.my_module
+  storage_plugin.my_custom_storage.class_name: MyCustomStorageClass
+```
+
+内置后端: CPU memory, local disk, NIXL (GPU P2P), Redis, InfiniStore, Mooncake, S3, NFS, WEKA, GDS, Valkey。
+
+#### 三方对比表
+
+| 能力 | TRT-LLM Connector API | Dynamo KVBM | LMCache |
+|------|----------------------|-------------|---------|
+| **扩展模型** | Python Scheduler+Worker 类，YAML 配置 | Rust storage traits + NIXL plugin | Python StoragePluginInterface，YAML 配置 |
+| **外部存储后端** | 自定义 connector（文件系统示例） | NIXL G4 opaque blob store | Redis, S3, NFS, Mooncake, InfiniStore, WEKA, GDS, Valkey |
+| **多层 offloading** | GPU → CPU（`host_cache_size`） | GPU → CPU → Disk → Remote (G1-G4) | GPU → CPU → Disk → Remote |
+| **逐层异步传输** | Issue #9212，**未实现** | 未文档化 | **已支持** |
+| **Mooncake 集成** | 2025-12 已集成 | 通过 NIXL | 原生支持 |
+| **自定义后端难度** | 中等 — 实现 ~10 个 Python 方法 | 较高 — Rust traits + NIXL 集成 | **最简单** — Python 接口 + 动态插件加载 |
+| **支持引擎** | TRT-LLM only | TRT-LLM, vLLM, SGLang | vLLM, SGLang |
+
+#### 关键差异分析
+
+- **TRT-LLM Connector API** 是最接近 LMCache `StorageBackendInterface` 的扩展点。通过实现 `KvCacheConnectorScheduler` + `KvCacheConnectorWorker` 可插入自定义存储后端（Redis、S3、文件系统等）。参考示例演示了文件系统持久化。
+
+- **Dynamo KVBM** 在更低层级（Rust）操作，提供更紧密集成的高性能内存管理层。自定义存储通过 NIXL 插件系统添加，而非 Python 接口。
+
+- **Mooncake Transfer Engine** 提供高速 RDMA 传输（约 2.4x 快于替代方案），已集成到 TRT-LLM。LMCache 将 Mooncake 作为远程存储后端之一。
+
+- **TRT-LLM 当前缺少**逐层异步 KV 传输（vLLM+LMCache 已支持）。当前 disaggregated serving 在 prefill 完成后做整体 KV 传输，长 context 时 TTFT 较慢。Issue #9212 展示潜在 **8x 加速**（Qwen3-32B: 32ms vs 265ms）。
 
 ---
 
@@ -873,6 +1020,21 @@ Dynamo (推理编排)
 - [Azure AKS + Dynamo](https://blog.aks.azure.com/2025/10/24/dynamo-on-aks)
 - [Google Cloud + Dynamo](https://cloud.google.com/blog/products/compute/ai-inference-recipe-using-nvidia-dynamo-with-ai-hypercomputer)
 
+### KV Cache 扩展
+- [TRT-LLM KV Cache Connector API](https://nvidia.github.io/TensorRT-LLM/features/kv-cache-connector.html)
+- [TRT-LLM KV Cache System](https://nvidia.github.io/TensorRT-LLM/features/kvcache.html)
+- [TRT-LLM Torch KV Cache Manager](https://nvidia.github.io/TensorRT-LLM/torch/kv_cache_manager.html)
+- [Dynamo KVBM Architecture](https://docs.nvidia.com/dynamo/latest/kvbm/kvbm_architecture.html)
+- [Dynamo KVBM TRT-LLM Setup](https://docs.nvidia.com/dynamo/latest/kvbm/trtllm-setup.html)
+- [Dynamo KVBM vLLM Setup](https://docs.nvidia.com/dynamo/latest/kvbm/vllm-setup.html)
+- [LMCache Architecture](https://docs.lmcache.ai/developer_guide/architecture.html)
+- [Extending LMCache Backends](https://docs.lmcache.ai/developer_guide/extending_lmcache/index.html)
+- [LMCache Backend Extension Blog](https://blog.lmcache.ai/2025-09-11-extending-lmcache-backends/)
+- [LMCache x Mooncake](https://blog.lmcache.ai/2025-05-08-mooncake/)
+- [Mooncake GitHub](https://github.com/kvcache-ai/Mooncake)
+- [NVIDIA Dynamo KVBM Blog](https://developer.nvidia.com/blog/how-to-reduce-kv-cache-bottlenecks-with-nvidia-dynamo/)
+
 ### 相关 Issues
 - [TRT-LLM Layer-wise KV Transfer (#9212)](https://github.com/NVIDIA/TensorRT-LLM/issues/9212)
+- [TRT-LLM KV Offload (#7322)](https://github.com/NVIDIA/TensorRT-LLM/issues/7322)
 - [TRT-LLM Prometheus Metrics Bug (#9678)](https://github.com/NVIDIA/TensorRT-LLM/issues/9678)
