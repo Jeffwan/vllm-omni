@@ -568,7 +568,7 @@ NIXL Agent 架构:
 
 > **为何不用 NCCL**: KV cache 传输是小块（256KB-1MB）、高频、点对点的模式，NIXL 的 SM-free 特性意味着传输期间所有 SM 都可用于推理计算。
 
-### 5.3 KV Cache Transfer 后端对比
+### 5.4 KV Cache Transfer 后端对比
 
 | 后端 | 状态 | 说明 |
 |------|------|------|
@@ -582,7 +582,7 @@ cache_transceiver_config:
   backend: NIXL  # 或 UCX, MPI, DEFAULT
 ```
 
-### 5.4 Disaggregated KV Cache 传输流程
+### 5.5 Disaggregated KV Cache 传输流程
 
 1. Worker 初始化后，将 **NIXL 元数据**（所有 KV cache blocks 的内存描述符）存储到 etcd
 2. Prefill worker 首次使用时加载并缓存这些描述符；后续请求只需 block ID
@@ -590,7 +590,7 @@ cache_transceiver_config:
 4. 支持 prefill 和 decode 间**不同 TP 策略**，高性能 kernel 将 KV blocks 转置为匹配布局
 5. Dynamo 内存分配器合并连续 blocks 为更大 blocks 减少总传输次数
 
-### 5.5 KVBM Connector API
+### 5.6 KVBM Connector API
 
 Dynamo 提供自定义 connector:
 - `DynamoKVBMConnectorLeader`（调度器侧）
@@ -608,7 +608,7 @@ DYN_KVBM_DISK_CACHE_GB=20
 
 构建: `./container/build.sh --framework trtllm --enable-kvbm`
 
-### 5.6 KV Cache Connector API（TRT-LLM 内部）
+### 5.7 KV Cache Connector API（TRT-LLM 内部）
 
 TRT-LLM 的 KV Cache Connector API 提供状态传输的抽象层：
 - KV cache 交换模块与 KV cache manager 和底层通信库**模块化解耦**
@@ -616,7 +616,7 @@ TRT-LLM 的 KV Cache Connector API 提供状态传输的抽象层：
 - 重叠优化: 一个请求发送/接收 KV blocks 时，其他请求继续计算
 - 多 GPU 并行: 不同 GPU 组间的 KV cache 传输并行执行
 
-### 5.7 计算与通信重叠
+### 5.8 计算与通信重叠
 
 **请求级重叠（当前实现）**:
 ```
@@ -628,7 +628,7 @@ GPU 1:  [Decode Req X]  [<── Receive KV A] [Decode Req A]
 ```
 一个请求的 KV cache 传输期间，batch 中其他请求继续 forward pass。多 GPU 实例的不同 GPU 对间传输并行执行。
 
-### 5.8 层级异步传输（GitHub issue #9212）
+### 5.9 层级异步传输（GitHub issue #9212）
 
 不再等待完整 prefill 完成后才传输 KV cache，而是**每层 KV cache 计算完成后立即传输**：
 
@@ -645,7 +645,7 @@ GPU 1:  [Decode Req X]  [<── Receive KV A] [Decode Req A]
 
 **实测结果（Qwen3-32B，TP4，Ethernet）**: 逐层异步传输 **32ms** vs 传统批量传输 **265ms**，8x+ 加速。
 
-### 5.8 性能基准（DeepSeek R1 on GB200）
+### 5.10 性能基准（DeepSeek R1 on GB200）
 
 | 配置 | ISL/OSL | 加速比 |
 |------|---------|--------|
