@@ -1,0 +1,2194 @@
+╭─── Claude Code v2.1.81 ──────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                Welcome back Jiaxin!                │ started                 │
+│                                                    │ Run /init to create a … │
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ Recent activity         │
+│                        ▘▘ ▝▝                       │ No recent activity      │
+│        Opus 4.6 (1M context) · Claude Max ·        │                         │
+│        seedjeffwan@gmail.com's Organization        │                         │
+│                ~/workspace/vllm-omni               │                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+❯ please @docs/user_guide/examples/online_serving/bagel.md, I want to           
+orchestrate the omni mode in distributed pattern. on multiple node, but I do    
+not quite understand how it run it.                                             
+                                                                                
+1. how does mooncake plays a role here let's check the code, how kv sync to     
+mooncake,and consumed by another stage?                                         
+                                                                                
+2. how to allocate different stage to different node?                           
+                                                                                
+3. how ray works here? can it orchestrate multi-node?                           
+                                                                                
+Let;s figure these out, draw some diagram to understand the workflow            
+
+⏺ I'll explore the codebase to answer your three questions. Let me launch
+  parallel investigations.
+
+⏺ 3 Explore agents finished (ctrl+o to expand)
+   ├─ Explore Mooncake KV sync code · 3 tool uses · 17.7k tokens
+   │  ⎿  Done
+   ├─ Explore stage allocation to nodes · 0 tool uses
+   │  ⎿  Done
+   └─ Explore Ray's role in multi-node · 0 tool uses
+      ⎿  Done
+
+⏺ Great, I've done a deep dive into the codebase. Here are my findings with
+  diagrams.
+
+  ---
+  1. How Mooncake Plays a Role (KV Cache Sync)
+
+  Mooncake acts as a distributed key-value store that bridges stages running on
+  different nodes. The Thinker (Stage 0) produces KV cache during prefill and
+  writes it to Mooncake; the DiT (Stage 1) reads it back.
+
+  Data Flow
+
+  ┌─────────────────── Node A ───────────────────┐     ┌─────────────── Node B
+  ───────────────┐
+  │                                               │     │
+                 │
+  │  Stage 0 (Thinker LLM)                       │     │  Stage 1 (DiT
+  Diffusion)             │
+  │  ┌─────────────────────────┐                  │     │
+  ┌──────────────────────────┐        │
+  │  │ GPU: AR Model Forward   │                  │     │  │ Diffusion Model
+  Runner   │        │
+  │  │   ↓                     │                  │     │  │
+        │        │
+  │  │ KV Cache in GPU blocks  │                  │     │  │ kv_transfer_manager
+        │        │
+  │  │   ↓                     │                  │     │  │
+  .receive_kv_cache()    │        │
+  │  │ kv_transfer_manager     │                  │     │  │       ↓
+        │        │
+  │  │   .handle_finished_     │                  │     │  │ connector.get(
+        │        │
+  │  │    requests_kv_transfer()                  │     │  │   from="0", to="1",
+        │        │
+  │  │       ↓                 │                  │     │  │
+  key="omni_0_to_1_kv_   │        │
+  │  │ _extract_kv_cache()     │                  │     │  │
+  cache_{req_id}")   │        │
+  │  │   GPU → CPU tensors     │                  │     │  │       ↓
+        │        │
+  │  │   [seq_len, heads, dim] │                  │     │  │ Deserialize → GPU
+  tensor │        │
+  │  │       ↓                 │                  │     │  │       ↓
+        │        │
+  │  │ connector.put(          │                  │     │  │ Attach as
+  past_key_values│        │
+  │  │   from="0", to="1",    │   ┌──────────┐   │     │  │ to request
+       │        │
+  │  │   key, serialized_data) │──▶│ Mooncake │◀──│─────│──│
+        │        │
+  │  │                         │   │  Master  │   │     │
+  └──────────────────────────┘        │
+  │  └─────────────────────────┘   │  Store   │   │     │
+                 │
+  │                                └──────────┘   │     │
+                 │
+  └───────────────────────────────────────────────┘
+  └──────────────────────────────────────┘
+
+  Key Code Paths
+
+  Write side (kv_transfer_manager.py:160-361):
+  GPU KV blocks → _extract_kv_cache() → reshape to [seq_len, n_heads, head_dim]
+  on CPU
+    → serialize via msgpack → connector.put() with key
+  "omni_0_to_1_kv_cache_{req_id}"
+    → MooncakeDistributedStore.put() with retry (20 attempts, 50ms backoff)
+
+  Read side (kv_transfer_manager.py:363-460):
+  connector.get() polls Mooncake with 30s timeout
+    → deserialize → move tensors to target GPU device
+    → attach to request.sampling_params.past_key_values
+    → DiT uses cached KV in its forward pass
+
+  Connector Config (bagel_multiconnector.yaml:76-88)
+
+  connectors:
+    mooncake_connector:
+      name: MooncakeStoreConnector
+      extra:
+        host: "127.0.0.1"
+        metadata_server: "http://<MASTER_IP>:8080/metadata"
+        master: "<MASTER_IP>:50051"
+        segment: 512000000    # 512MB buffer
+        proto: "tcp"
+
+  The Mooncake Master runs as a separate process providing service discovery
+  (metadata server on :8080) and coordination (RPC on :50051). Both Stage 0 and
+  Stage 1 connect to the same master to exchange data.
+
+  ---
+  2. Stage Allocation to Different Nodes
+
+  Architecture Overview
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                     YAML Stage Config                            │
+  │  ┌──────────────────────┐    ┌──────────────────────┐           │
+  │  │ stage_id: 0          │    │ stage_id: 1          │           │
+  │  │ type: llm            │    │ type: diffusion      │           │
+  │  │ model_stage: thinker │    │ model_stage: dit     │           │
+  │  │ devices: "0"         │    │ devices: "0"         │           │
+  │  │ output_connectors:   │    │ input_connectors:    │           │
+  │  │   to_stage_1: mc     │    │   from_stage_0: mc   │           │
+  │  │ kv: need_send=true   │    │ kv: need_recv=true   │           │
+  │  └──────────────────────┘    └──────────────────────┘           │
+  └──────────────────────────────────────────────────────────────────┘
+                          ↓ parsed by ↓
+
+    Node A: vllm serve ... --stage-id 0 -oma <IP> -omp 8091
+    Node B: vllm serve ... --stage-id 1 --headless -oma <IP> -omp 8091
+
+  Important Finding: Multi-Node is Work-in-Progress
+
+  After reading the code carefully, I found a critical detail:
+
+  - --stage-id is parsed in CLI (serve.py:114-178) and validated (requires -oma
+  and -omp), but the stage filtering logic is not fully wired in
+  AsyncOmniEngine. Currently, _resolve_stage_configs() loads ALL stages
+  regardless of --stage-id.
+  - --headless is deprecated — calling it raises RuntimeError
+  (serve.py:375-391).
+  - There is an OmniCoordinator infrastructure (omni_coordinator.py) built with
+  ZMQ ROUTER/PUB sockets for stage registration, heartbeats, and discovery — but
+   it's not yet activated in the main engine loop.
+
+  So the doc describes the intended design, but the actual multi-node
+  per-stage-per-node deployment path is still being built. What does work today
+  is:
+
+  ┌─────────── Single Node (or Same Process Group) ─────────────┐
+  │                                                              │
+  │  AsyncOmniEngine                                             │
+  │  ┌────────────────────────────────┐                          │
+  │  │ Orchestrator (background thread)│                         │
+  │  │   ↕ janus queues               │                         │
+  │  │   ├── StageEngineCoreClient[0] ←──── vLLM EngineCore[0]  │
+  │  │   │     (ZMQ sockets)                 (subprocess)        │
+  │  │   └── StageEngineCoreClient[1] ←──── EngineCore[1]       │
+  │  │         (ZMQ sockets)                 (subprocess)        │
+  │  └────────────────────────────────┘                          │
+  │                                                              │
+  │  Connectors bridge data between stages:                      │
+  │  SharedMemoryConnector (same node) or                        │
+  │  MooncakeStoreConnector (cross-node KV cache)                │
+  └──────────────────────────────────────────────────────────────┘
+
+  What works for multi-node today: The Mooncake connector can transfer KV cache
+  across nodes even when both stages are spawned from the same engine — but the
+  per-node stage isolation (--stage-id 0 on node A, --stage-id 1 on node B)
+  isn't fully functional yet.
+
+  ---
+  3. Ray's Role
+
+  Current Status: Prepared but NOT Active
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │              vllm-omni Execution Backends                   │
+  │                                                             │
+  │  ┌─────────────────┐    ┌─────────────────────────────────┐ │
+  │  │  Ray Backend     │    │  Multiprocessing Backend        │ │
+  │  │  (PLANNED)       │    │  (ACTIVE - DEFAULT)             │ │
+  │  │                  │    │                                 │ │
+  │  │  ray_utils/      │    │  AsyncOmniEngine                │ │
+  │  │   utils.py       │    │    → Orchestrator thread        │ │
+  │  │                  │    │    → StageEngineCoreClient       │ │
+  │  │  • ray.init()    │    │    → launch_core_engines()      │ │
+  │  │  • @ray.remote   │    │    → ZMQ IPC sockets            │ │
+  │  │    actors        │    │    → Device file locks           │ │
+  │  │  • Placement     │    │                                 │ │
+  │  │    Groups        │    │  worker_backend="multi_process"  │ │
+  │  │                  │    └─────────────────────────────────┘ │
+  │  │  worker_backend= │                                       │
+  │  │   "ray"          │    ┌─────────────────────────────────┐ │
+  │  └─────────────────┘    │  Cross-Node Communication       │ │
+  │                          │  (ACTIVE)                       │ │
+  │                          │                                 │ │
+  │                          │  MooncakeStoreConnector (TCP)   │ │
+  │                          │  MooncakeTransferEngine (RDMA)  │ │
+  │                          │  SharedMemoryConnector (local)  │ │
+  │                          └─────────────────────────────────┘ │
+  └─────────────────────────────────────────────────────────────┘
+
+  Ray utilities exist but aren't called
+
+  ┌───────────────────────────────────┬──────────────────────┬──────────────┐
+  │               File                │     What's there     │    Used?     │
+  ├───────────────────────────────────┼──────────────────────┼──────────────┤
+  │                                   │ initialize_ray_clust │ No — never   │
+  │ ray_utils/utils.py                │ er(), create_placeme │ called from  │
+  │                                   │ nt_group(),          │ AsyncOmniEng │
+  │                                   │ start_ray_actor()    │ ine          │
+  ├───────────────────────────────────┼──────────────────────┼──────────────┤
+  │ docs/design/feature/ray_based_exe │ Design doc for       │ Planning doc │
+  │ cution.md                         │ Ray-based multi-node │  only        │
+  ├───────────────────────────────────┼──────────────────────┼──────────────┤
+  │                                   │ worker_backend="ray" │ Infrastructu │
+  │ initialization.py:277-294         │  branch (disables    │ re ready,    │
+  │                                   │ SHM)                 │ not default  │
+  └───────────────────────────────────┴──────────────────────┴──────────────┘
+
+  Why Ray isn't needed yet
+
+  - Within a stage: vLLM's own distributed_executor_backend="mp" handles TP/PP
+  via multiprocessing
+  - Across stages: The Orchestrator + ZMQ + Mooncake connectors handle it
+  - Multi-node: Mooncake provides the cross-node data plane; the control plane
+  (coordinator) is being built with ZMQ, not Ray
+
+  When Ray would be useful
+
+  The planned design (ray_based_execution.md) envisions:
+  # Head node
+  ray start --head --port=6399
+  # Worker node
+  ray start --address=<HEAD>:6399
+
+  # Then vllm serve with --worker-backend ray
+  # Ray placement groups would assign stages to specific nodes
+
+  ---
+  End-to-End Workflow Diagram
+
+                            ┌─────────────────────────┐
+                            │   Client Request         │
+                            │   "A cute cat" text2img  │
+                            └───────────┬─────────────┘
+                                        │
+                                        ▼
+                       ┌────────────────────────────────┐
+                       │        API Server (:8000)       │
+                       │        AsyncOmniEngine          │
+                       └────────────┬───────────────────┘
+                                    │
+                                    ▼
+                       ┌────────────────────────────────┐
+                       │     Orchestrator (bg thread)    │
+                       │     Routes requests between     │
+                       │     stages via janus queues      │
+                       └──┬──────────────────────────┬──┘
+                          │                          │
+              ┌───────────▼──────────┐   ┌──────────▼───────────┐
+              │  Stage 0: Thinker    │   │  Stage 1: DiT        │
+              │  (LLM - Qwen2.5)    │   │  (Diffusion)         │
+              │                      │   │                      │
+              │  1. Prefill prompt   │   │  4. Receive KV cache │
+              │  2. Generate tokens  │   │     from Mooncake    │
+              │     (thinking +      │   │  5. Run diffusion    │
+              │      image tokens)   │   │     denoising steps  │
+              │  3. Extract KV cache │   │  6. Output latents   │
+              │     → Mooncake put() │   │     → decode to PNG  │
+              │                      │   │                      │
+              │  GPU: ~15GB + KV     │   │  GPU: ~26.5GB        │
+              └──────────┬───────────┘   └──────────┬───────────┘
+                         │                          ▲
+                         │    ┌──────────────┐      │
+                         └───▶│   Mooncake   │──────┘
+                              │   Master     │
+                              │              │
+                              │  KV Store    │
+                              │  :50051 RPC  │
+                              │  :8080 HTTP  │
+                              └──────────────┘
+
+  ---
+  Summary
+
+  Question: Mooncake's role
+  Answer: Distributed KV cache store. Stage 0 extracts KV from GPU → serializes
+  →
+    put() to Mooncake. Stage 1 get() polls → deserializes → attaches to DiT
+    request as past_key_values.
+  ────────────────────────────────────────
+  Question: Stage-per-node allocation
+  Answer: The --stage-id / --headless CLI args exist but are not fully 
+    functional. Today, all stages run from a single AsyncOmniEngine process.
+    Mooncake connector can transfer KV across nodes, but true per-node stage
+    isolation is still WIP.
+  ────────────────────────────────────────
+  Question: Ray
+  Answer: Infrastructure prepared (ray_utils/utils.py) but not active. Current
+    backend is multiprocessing + ZMQ. Ray is planned for future multi-node
+    placement group scheduling.
+
+  The multi-node story right now is: Mooncake handles the data plane (KV cache
+  transfer works cross-node), but the control plane (launching Stage 0 on Node A
+   and Stage 1 on Node B as independent processes) is still being wired up.
+
+✻ Cooked for 4m 48s
+
+❯ let's write this down into a doc                                              
+
+⏺ Explore(Find existing docs structure)
+  ⎿  Done (9 tool uses · 30.6k tokens · 1m 14s)
+  (ctrl+o to expand)
+
+⏺ Let me fetch that issue first to incorporate the latest status.
+
+⏺ Bash(gh issue view 1192 --json title,body,comments,labels,state)
+  ⎿  {
+       "body": "\n***\n\n# [RFC]: Omni Connector For Full Disaggregation Ar
+     chitecture  2026 Q1  Roadmap\n\n## Motivation\nTo achieve higher scala
+     … +114 lines (ctrl+o to expand)
+
+⏺ Excellent — this RFC is very informative. Key insights that update our
+  understanding:
+
+  1. OmniStage Ray wrapper is being REMOVED (P1), not enhanced — the direction
+  is vLLM-native Worker Actor pattern
+  2. EPDG (Encoder-Prefill-Decode-Generate) is the target disaggregation
+  granularity
+  3. Communication is moving from stage level → model runner level
+  4. PD separation will leverage vLLM's existing Mooncake-based KV connector
+  5. Current OmniStage + worker must stay on same node — this limits TP>8
+
+  Let me now write the doc.
+
+  Read 4 files (ctrl+o to expand)
+
+⏺ Now let me read the architecture overview for additional context on the
+  overall design.
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ Now I have all the context. Let me write the document.
+
+⏺ Write(docs/design/feature/bagel_multinode_deployment.md)
+  ⎿  Wrote 378 lines to docs/design/feature/bagel_multinode_deployment.md
+       1 # BAGEL Multi-Node Deployment: Architecture Deep Dive
+       2 
+       3 This document explains how BAGEL's multi-stage pipeline (Thinker
+          + DiT) is distributed across nodes in vllm-omni, covering the r
+         ole of Mooncake connectors, stage allocation, Ray, and the roadm
+         ap toward full disaggregation.
+       4 
+       5 ## Table of Contents
+       6 
+       7 - [1. High-Level Architecture](#1-high-level-architecture)
+       8 - [2. Mooncake: Cross-Node KV Cache Transfer](#2-mooncake-cross-
+         node-kv-cache-transfer)
+       9 - [3. Stage Allocation Across Nodes](#3-stage-allocation-across-
+         nodes)
+      10 - [4. Ray: Current Status and Roadmap](#4-ray-current-status-and
+         -roadmap)
+     … +368 lines (ctrl+o to expand)
+
+⏺ Now update the index to include the new doc.
+
+⏺ Update(docs/design/index.md)
+  ⎿  Added 1 line
+      10  
+      11  - [Disaggregated Inference](feature/disaggregated_inference.md)
+      12  - [Ray-based Execution](feature/ray_based_execution.md)
+      13 +- [BAGEL Multi-Node Deployment](feature/bagel_multinode_deploym
+         +ent.md)                                                        
+      14  
+      15  ## Module Design Documents
+      16  
+
+⏺ Done. Here's what was created:
+
+  New doc: docs/design/feature/bagel_multinode_deployment.md
+
+  It covers all three questions with diagrams and code paths:
+
+  1. Mooncake KV sync — Write path (GPU → CPU → serialize → put()) and read path
+   (get() → deserialize → GPU → past_key_values), with the key format and
+  connector choices table
+  2. Stage allocation — Current single-process architecture vs. the documented
+  multi-node design, with an honest status table showing --stage-id and
+  --headless aren't fully wired yet
+  3. Ray — Not active today (multiprocessing + ZMQ is the backend), with the
+  roadmap direction from RFC #1192: remove OmniStage wrapper → native Worker
+  Actor pattern
+  4. EPDG roadmap — Incorporated the P0/P1 priority matrix from the RFC,
+  including the target architecture where Encoder/Prefill/Decode/Generate are
+  independently scalable
+
+  The doc index (docs/design/index.md) is also updated.
+
+✻ Cooked for 4m 5s
+
+❯ 1.mooncake's metadata_server and master, seems it have two urls, but same     
+host, what's the purpose? are they for different work?                          
+
+⏺ Good question. Let me check the code to see how each is used.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The key line is _init_store() at line 58-59:
+
+  self.store.setup(
+      self.host, self.metadata, self.segment, self.localbuf, self.proto,
+  self.rdma, self.master
+  )
+
+  Both self.metadata and self.master are passed into the Mooncake library's
+  setup(). They serve different roles in Mooncake's own architecture:
+
+  Two URLs, Two Services
+
+  ┌─────────────────── mooncake_master process ───────────────────┐
+  │                                                                │
+  │   ┌──────────────────────────┐  ┌───────────────────────────┐ │
+  │   │  gRPC Master (:50051)    │  │  HTTP Metadata Server     │ │
+  │   │                          │  │  (:8080)                   │ │
+  │   │  • Control plane         │  │                            │ │
+  │   │  • Cluster membership    │  │  • Service discovery       │ │
+  │   │  • Replication config    │  │  • Key → node mapping      │ │
+  │   │  • Store lifecycle       │  │  • REST API for lookups    │ │
+  │   │    (create, close, GC)   │  │  • "Where is this key?"   │ │
+  │   └──────────────────────────┘  └───────────────────────────┘ │
+  └────────────────────────────────────────────────────────────────┘
+
+  URL: master: "10.90.67.86:50051"
+  Config key: master
+  Default: 127.0.0.1:50051
+  Purpose: gRPC control plane — cluster management, store lifecycle, replication
+
+    coordination
+  ────────────────────────────────────────
+  URL: metadata_server: "http://10.90.67.86:8080/metadata"
+  Config key: metadata_server
+  Default: http://127.0.0.1:8080/metadata
+  Purpose: HTTP data plane routing — key-to-node lookup so get() knows which
+  node
+    holds a key
+
+  How they work together
+
+  Stage 0 calls put("kv_cache_req123", data):
+
+    1. Connector serializes data
+    2. store.put() contacts Master (:50051 gRPC) to register the key
+    3. Master records: "kv_cache_req123 lives on node 10.x.x.1"
+    4. Data stored in local memory segment
+
+  Stage 1 calls get("kv_cache_req123"):
+
+    1. store.get() queries Metadata Server (:8080 HTTP):
+       GET http://10.90.67.86:8080/metadata?key=kv_cache_req123
+       → Response: "node 10.x.x.1, segment offset 0xABCD"
+    2. Fetches data from that node over TCP/RDMA
+    3. Returns deserialized object
+
+  Master (gRPC :50051) = "manage the cluster and coordinate writes"
+  Metadata Server (HTTP :8080) = "find where data lives so readers can fetch it"
+
+  They're both served by the same mooncake_master process (that's why they share
+   the same host IP), but they're two separate services on different ports with
+  different protocols, handling different concerns. The split allows the read
+  path (metadata lookups) to scale independently from the write/control path
+  (cluster management) — HTTP is also easier to debug and monitor than gRPC.
+
+❯ write above down into the doc                                                 
+                                                                                
+I have another questions                                                        
+   Node A: vllm serve ... --stage-id 0 -oma <IP> -omp 8091                      
+    Node B: vllm serve ... --stage-id 1 --headless -oma <IP> -omp 8091          
+                                                                                
+what does -oma and -omp mean?  --headless means it hides it self and only       
+expose --stage-0's endpoint?let's try to understand these configs               
+
+⏺ Explore(Explore -oma -omp headless CLI)
+  ⎿  Done (33 tool uses · 90.0k tokens · 3m 13s)
+  (ctrl+o to expand)
+
+⏺ Let me update the doc first, then dig into the gaps.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now let me update the doc with both the Mooncake master/metadata explanation
+  and the CLI args explanation, then explore the gaps for the user's new
+  question.
+
+⏺ Update(docs/design/feature/bagel_multinode_deployment.md)  ⎿  Added 37 lines, removed 5 lines
+      159  
+      160  The RDMA connector (`MooncakeTransferEngineConnector`) support
+           s zero-copy fast paths for tensors and managed memory pools. I
+           t is the P0 target per the [Q1 2026 roadmap](https://github.co
+           m/vllm-project/vllm-omni/issues/1192).
+      161  
+      162 -### 2.5 Mooncake Master                                       
+      162 +### 2.5 Mooncake Master: Two Services, One Process            
+      163  
+      164 -Mooncake Master is a separate process providing:              
+      164 +The `mooncake_master` process exposes **two separate services*
+          +* on different ports. Both are passed to `MooncakeDistributedS
+          +tore.setup()` (`mooncake_store_connector.py:58-59`):          
+      165  
+      166 -- **RPC (:50051)**: Control-plane coordination between store c
+          -lients                                                        
+      167 -- **HTTP Metadata Server (:8080)**: Service discovery for all 
+          -participants                                                  
+      166 +```                                                           
+      167 +┌────────────────────── mooncake_master process ──────────────
+          +────────┐                                                     
+      168 +│                                                             
+          +         │                                                    
+      169 +│   ┌───────────────────────────┐   ┌─────────────────────────
+          +──────┐ │                                                     
+      170 +│   │  gRPC Master (:50051)     │   │  HTTP Metadata Server (:
+          +8080) │ │                                                     
+      171 +│   │                           │   │                         
+          +      │ │                                                     
+      172 +│   │  • Cluster management     │   │  • Key → node location l
+          +ookup │ │                                                     
+      173 +│   │  • Store lifecycle        │   │  • Service discovery    
+          +      │ │                                                     
+      174 +│   │  • Replication config     │   │  • REST API for readers 
+          +      │ │                                                     
+      175 +│   │  • Write coordination     │   │  • "Where does this key 
+          +live?"│ │                                                     
+      176 +│   └───────────────────────────┘   └─────────────────────────
+          +──────┘ │                                                     
+      177 +└─────────────────────────────────────────────────────────────
+          +─────────┘                                                    
+      178 +```                                                           
+      179  
+      169 -Both Stage 0 and Stage 1 connect to the same master. For singl
+          -e-node testing, `127.0.0.1` works. For multi-node, use the orc
+          -hestrator node's IP.                                          
+      180 +| Config Key | Example Value | Protocol | Purpose |           
+      181 +|:-----------|:-------------|:---------|:--------|            
+      182 +| `master` | `10.90.67.86:50051` | gRPC | **Control plane** — 
+          +cluster membership, store lifecycle, write coordination |     
+      183 +| `metadata_server` | `http://10.90.67.86:8080/metadata` | HTT
+          +P | **Data plane routing** — key-to-node lookup so `get()` kno
+          +ws which node holds a key |                                   
+      184  
+      185 +**How they work together during a KV transfer:**              
+      186 +                                                              
+      187 +```                                                           
+      188 +Stage 0 calls put("kv_cache_req123", data):                   
+      189 +  1. store.put() contacts Master (:50051 gRPC) to register the
+          + key                                                          
+      190 +  2. Master records: "kv_cache_req123 lives on node 10.x.x.1" 
+      191 +  3. Data stored in local memory segment                      
+      192 +                                                              
+      193 +Stage 1 calls get("kv_cache_req123"):                         
+      194 +  1. store.get() queries Metadata Server (:8080 HTTP):        
+      195 +     GET http://10.90.67.86:8080/metadata?key=kv_cache_req123 
+      196 +     → Response: "node 10.x.x.1, segment offset 0xABCD"       
+      197 +  2. Fetches data from that node over TCP/RDMA                
+      198 +  3. Returns deserialized object                              
+      199 +```                                                           
+      200 +                                                              
+      201 +The split allows the read path (metadata lookups) to scale ind
+          +ependently from the write/control path (cluster management). B
+          +oth Stage 0 and Stage 1 connect to the same master. For single
+          +-node testing, `127.0.0.1` works. For multi-node, use the orch
+          +estrator node's actual IP.                                    
+      202 +                                                              
+      203  ---
+      204  
+      205  ## 3. Stage Allocation Across Nodes
+
+⏺ Now add the CLI args explanation to section 3.
+
+⏺ Update(docs/design/feature/bagel_multinode_deployment.md)
+  ⎿  Added 36 lines, removed 4 lines
+      223  └─────────────────────────────────────────────────────────────
+           ─┘
+      224  ```
+      225  
+      226 -### 3.2 Multi-Node Deployment (Documented, WIP)               
+      226 +### 3.2 CLI Arguments for Multi-Node                          
+      227  
+      228 -The user-facing documentation (`bagel.md`) describes a per-nod
+          -e stage deployment:                                           
+      228 +The multi-node CLI arguments are defined in `serve.py:114-178`
+          +:                                                             
+      229  
+      230  ```bash
+      231  # Node A: Stage 0 (Thinker / Orchestrator)
+     ...
+      242      -oma <ORCHESTRATOR_IP> -omp 8091
+      243  ```
+      244  
+      245 +**What each argument means:**                                 
+      246 +                                                              
+      247 +| Argument | Full Name | Purpose |                            
+      248 +|:---------|:----------|:--------|                            
+      249 +| `--stage-id <N>` | Stage ID | Tells this process to run **on
+          +ly** stage N from the YAML config (0 = Thinker, 1 = DiT) |    
+      250 +| `-oma <IP>` | `--omni-master-address` | IP of the **orchestr
+          +ator node** (Stage 0). Stage 1 uses this to connect back to St
+          +age 0 for task coordination |                                 
+      251 +| `-omp <port>` | `--omni-master-port` | Port on the orchestra
+          +tor that Stage 1 connects to for receiving work assignments | 
+      252 +| `--headless` | Headless mode | Run **without** the API serve
+          +r — worker-only mode. Only Stage 0 exposes the HTTP API; Stage
+          + 1 just processes tasks and returns results |                 
+      253 +                                                              
+      254 +**The intended design:**                                      
+      255 +                                                              
+      256 +```                                                           
+      257 +  Client → HTTP :8000                                         
+      258 +               │                                              
+      259 +  ┌────────────▼─────────────┐        ┌───────────────────────
+          +───┐                                                          
+      260 +  │  Node A (Stage 0)        │        │  Node B (Stage 1)     
+          +   │                                                          
+      261 +  │                          │        │                       
+          +   │                                                          
+      262 +  │  API Server (:8000)      │        │  NO API Server        
+          +   │                                                          
+      263 +  │  Orchestrator            │◄──────▶│  (--headless)         
+          +   │                                                          
+      264 +  │  Thinker Engine          │ -oma   │  DiT Engine           
+          +   │                                                          
+      265 +  │                          │ -omp   │                       
+          +   │                                                          
+      266 +  │  Listens on -omp (:8091) │ :8091  │  Connects to -oma:-omp
+          +  │                                                           
+      267 +  └──────────────────────────┘        └───────────────────────
+          +───┘                                                          
+      268 +          │                                     ▲             
+      269 +          │          ┌──────────────┐            │            
+      270 +          └─────────▶│   Mooncake   │────────────┘            
+      271 +                     │  (KV data)   │                         
+      272 +                     └──────────────┘                         
+      273 +```                                                           
+      274 +                                                              
+      275 +Stage 0 is the "master" — it owns the API server and the orche
+          +strator. Stage 1 is a "worker" — it connects to Stage 0's `-om
+          +p` port to receive work, and uses Mooncake to fetch KV cache. 
+          +The client only talks to Stage 0.                             
+      276 +                                                              
+      277  ### 3.3 Implementation Status
+      278  
+      279  | Feature | CLI Arg | Status |
+      280  |:--------|:--------|:-------|
+      281  | Stage selection | `--stage-id <N>` | Parsed and validated, b
+           ut **not wired** to filter stages in `AsyncOmniEngine` |
+      250 -| Headless mode | `--headless` | **Deprecated** — raises `Runt
+          -imeError` |                                                   
+      282 +| Headless mode | `--headless` | **Deprecated** — raises `Runt
+          +imeError` (`serve.py:375-391`) |                              
+      283  | Master address | `-oma <IP>` | Parsed, placeholder for futur
+           e cross-node coordination |
+      284  | Master port | `-omp <port>` | Parsed, placeholder for future
+            cross-node coordination |
+      285  
+      254 -The `--stage-id` argument requires `-oma` and `-omp` (validate
+          -d in `serve.py:66-67`), but `_resolve_stage_configs()` still l
+          -oads **all** stages regardless.                               
+      286 +The `--stage-id` argument requires `-oma` and `-omp` (validate
+          +d in `serve.py:66-67`), but `_resolve_stage_configs()` still l
+          +oads **all** stages regardless. The arguments flow through `As
+          +yncOmni` → `OmniBase` → `AsyncOmniEngine` as kwargs, but are n
+          +ever consumed.                                                
+      287  
+      288  ### 3.4 Stage Discovery Infrastructure (Built, Not Activated)
+      289  
+
+⏺ Doc updated. Now let me address your question about the gaps and Kubernetes.
+  Let me trace the exact code paths to identify precisely what's missing.
+
+⏺ Explore(Trace stage init and gaps)
+  ⎿  Done (38 tool uses · 76.2k tokens · 3m 52s)
+  (ctrl+o to expand)
+
+⏺ Noted — I'll use python instead of python3.
+
+  Now let me address your questions about the gaps. The exploration is complete.
+   Let me update the doc with the full gap analysis, then give you my take on
+  both approaches.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(docs/design/feature/bagel_multinode_deployment.md)
+  ⎿  Added 475 lines, removed 1 line
+      431  
+      432  ---
+      433  
+      434 -## 6. Related Documents                                       
+      434 +## 6. Gap Analysis: What's Missing for True Multi-Node        
+      435  
+      436 +This section identifies the exact code gaps between the curren
+          +t single-process architecture and true multi-node deployment (
+          +Stage 0 on Node A, Stage 1 on Node B as separate processes).  
+      437 +                                                              
+      438 +### 6.1 Gap Overview                                          
+      439 +                                                              
+      440 +```                                                           
+      441 +  What EXISTS today                     What's MISSING        
+      442 +  ─────────────────                     ──────────────        
+      443 +  ✅ CLI args parsed                    ❌ --stage-id doesn't 
+          +filter stages                                                 
+      444 +  ✅ Mooncake KV transfer works         ❌ Control plane is lo
+          +cal-only                                                      
+      445 +  ✅ OmniCoordinator built              ❌ Not wired into Orch
+          +estrator                                                      
+      446 +  ✅ Connector abstraction              ❌ No RemoteStageClien
+          +t                                                             
+      447 +  ✅ Stage config YAML                  ❌ --headless deprecat
+          +ed/broken                                                     
+      448 +```                                                           
+      449 +                                                              
+      450 +### 6.2 Gap 1: Stage Config Filtering (P0)                    
+      451 +                                                              
+      452 +**File:** `async_omni_engine.py:857-904`                      
+      453 +                                                              
+      454 +`_resolve_stage_configs()` loads **all** stages from YAML rega
+          +rdless of `--stage-id`. The `stage_id` kwarg flows all the way
+          + from CLI → `AsyncOmniEngine` but is never consumed.          
+      455 +                                                              
+      456 +**What to change:** After `load_and_resolve_stage_configs()` r
+          +eturns, filter by `kwargs.get("stage_id")`:                   
+      457 +                                                              
+      458 +```python                                                     
+      459 +# Pseudocode for the fix                                      
+      460 +config_path, stage_configs = load_and_resolve_stage_configs(..
+          +.)                                                            
+      461 +stage_id = kwargs.get("stage_id")                             
+      462 +if stage_id is not None:                                      
+      463 +    stage_configs = [c for c in stage_configs if c.stage_id ==
+          + stage_id]                                                    
+      464 +```                                                           
+      465 +                                                              
+      466 +**Effort:** Small. But everything else depends on this.       
+      467 +                                                              
+      468 +### 6.3 Gap 2: Orchestrator Assumes All Stages Are Local (P0) 
+      469 +                                                              
+      470 +**File:** `orchestrator.py:108-531`                           
+      471 +                                                              
+      472 +The Orchestrator holds all stages in `self.stage_clients` (a l
+          +ocal list) and calls methods directly:                        
+      473 +                                                              
+      474 +```python                                                     
+      475 +# orchestrator.py:443-531 - _forward_to_next_stage()          
+      476 +next_client = self.stage_clients[next_stage_id]  # Direct arra
+          +y access                                                      
+      477 +await next_client.add_request_async(request)       # Local met
+          +hod call                                                      
+      478 +```                                                           
+      479 +                                                              
+      480 +If Stage 1 is on another node, `self.stage_clients[1]` doesn't
+          + exist on Node A.                                             
+      481 +                                                              
+      482 +**What to change:** Introduce a dispatch layer:               
+      483 +- Local stage → current direct call                           
+      484 +- Remote stage → network call via `RemoteStageEngineCoreClient
+          +`                                                             
+      485 +                                                              
+      486 +The Orchestrator on Node A needs a **proxy client** for Stage 
+          +1 that forwards requests over the network.                    
+      487 +                                                              
+      488 +### 6.4 Gap 3: No Remote Stage Client (P0)                    
+      489 +                                                              
+      490 +**File:** `stage_engine_core_client.py:25-169`                
+      491 +                                                              
+      492 +`StageEngineCoreClient` inherits from vLLM's `AsyncMPClient` —
+          + hardcoded to local subprocess + ZMQ IPC. There's no network-c
+          +apable variant.                                               
+      493 +                                                              
+      494 +**What to create:** A `RemoteStageEngineCoreClient` with the s
+          +ame interface:                                                
+      495 +                                                              
+      496 +```python                                                     
+      497 +class RemoteStageEngineCoreClient:                            
+      498 +    """Proxy to a stage running on a remote node."""          
+      499 +                                                              
+      500 +    def __init__(self, remote_addr: str, remote_port: int, sta
+          +ge_id: int):                                                  
+      501 +        self.zmq_socket = ...  # Connect to remote stage's ZMQ
+          + endpoint                                                     
+      502 +                                                              
+      503 +    async def add_request_async(self, request):               
+      504 +        # Serialize request → send over network               
+      505 +        ...                                                   
+      506 +                                                              
+      507 +    async def get_output_async(self):                         
+      508 +        # Poll remote stage for outputs                       
+      509 +        ...                                                   
+      510 +```                                                           
+      511 +                                                              
+      512 +**Protocol choice:**                                          
+      513 +- ZMQ (aligned with existing codebase, low overhead)          
+      514 +- gRPC (type-safe, streaming, but adds dependency)            
+      515 +                                                              
+      516 +### 6.5 Gap 4: Request Forwarding Is In-Process Only (P1)     
+      517 +                                                              
+      518 +**File:** `orchestrator.py:443-531`                           
+      519 +                                                              
+      520 +`_forward_to_next_stage()` calls `next_client.process_engine_i
+          +nputs()` and `next_client.add_request_async()` — both are sync
+          +hronous local calls. For remote stages, the request (token IDs
+          +, embeddings, sampling params) must be serialized and sent ove
+          +r the network.                                                
+      521 +                                                              
+      522 +The data itself is small (token IDs + metadata), so latency im
+          +pact is ~1-5ms per hop — acceptable since DiT compute is much 
+          +longer.                                                       
+      523 +                                                              
+      524 +### 6.6 Gap 5: Output Collection Is Local Polling (P1)        
+      525 +                                                              
+      526 +**File:** `orchestrator.py:217-299`                           
+      527 +                                                              
+      528 +```python                                                     
+      529 +# _orchestration_loop() polls every stage locally             
+      530 +for stage_id in range(self.num_stages):                       
+      531 +    raw_outputs = await asyncio.wait_for(                     
+      532 +        self._poll_stage_raw(stage_id), timeout=0.001         
+      533 +    )                                                         
+      534 +```                                                           
+      535 +                                                              
+      536 +For remote stages, 1ms polling over network is wasteful. Optio
+          +ns:                                                           
+      537 +- **Push model:** Remote stage pushes outputs to Orchestrator 
+          +via ZMQ PUB/SUB                                               
+      538 +- **Long polling:** Remote stage holds connection until output
+          + is ready                                                     
+      539 +                                                              
+      540 +### 6.7 Gap 6: Headless Mode Deprecated (P1)                  
+      541 +                                                              
+      542 +**File:** `serve.py:375-391`                                  
+      543 +                                                              
+      544 +`--headless` raises `RuntimeError`. Worker nodes need a way to
+          + start without the API server.                                
+      545 +                                                              
+      546 +**What to change:** Resurrect headless as "worker mode":      
+      547 +```python                                                     
+      548 +if args.stage_id is not None and args.omni_master_address:    
+      549 +    # Worker mode: start only the assigned stage, connect to m
+          +aster                                                         
+      550 +    run_worker(args)                                          
+      551 +else:                                                         
+      552 +    # Master mode: start API server + orchestrator            
+      553 +    omni_run_server(args)                                     
+      554 +```                                                           
+      555 +                                                              
+      556 +### 6.8 Gap 7: OmniCoordinator Not Wired In (P1)              
+      557 +                                                              
+      558 +**File:** `omni_coordinator/omni_coordinator.py:19-185`       
+      559 +                                                              
+      560 +The coordinator is fully implemented (ZMQ ROUTER/PUB, heartbea
+          +ts, instance tracking) but **never instantiated** from `AsyncO
+          +mniEngine`. It's the right infrastructure for cross-node disco
+          +very.                                                         
+      561 +                                                              
+      562 +**What to wire:**                                             
+      563 +- Master node: start `OmniCoordinator`, bind to `-omp` port   
+      564 +- Worker node: start `OmniCoordClientForStage`, connect to `-o
+          +ma`:`-omp`                                                    
+      565 +- Worker sends registration: "I am Stage N at tcp://my-ip:port
+          +"                                                             
+      566 +- Master's Orchestrator queries coordinator for stage location
+          +s                                                             
+      567 +                                                              
+      568 +### 6.9 Summary: Implementation Order                         
+      569 +                                                              
+      570 +```                                                           
+      571 +┌─────────────────────────────────────────────────────────────
+          +────┐                                                         
+      572 +│  P0 (Must have — unblocks everything)                       
+          +    │                                                         
+      573 +│                                                             
+          +     │                                                        
+      574 +│  1. Stage filtering by --stage-id     → async_omni_engine.py
+          +    │                                                         
+      575 +│  2. RemoteStageEngineCoreClient       → new file            
+          +    │                                                         
+      576 +│  3. Orchestrator remote dispatch      → orchestrator.py     
+          +    │                                                         
+      577 +├─────────────────────────────────────────────────────────────
+          +────┤                                                         
+      578 +│  P1 (Enable clean multi-node UX)                            
+          +    │                                                         
+      579 +│                                                             
+          +     │                                                        
+      580 +│  4. Network request forwarding        → orchestrator.py     
+          +    │                                                         
+      581 +│  5. Network output collection         → orchestrator.py     
+          +    │                                                         
+      582 +│  6. Resurrect headless/worker mode    → serve.py, api_server
+          +.py │                                                         
+      583 +│  7. Wire OmniCoordinator              → orchestrator.py     
+          +    │                                                         
+      584 +└─────────────────────────────────────────────────────────────
+          +────┘                                                         
+      585 +```                                                           
+      586 +                                                              
+      587 +---                                                           
+      588 +                                                              
+      589 +## 7. Approach A: Minimal Changes to Make It Work             
+      590 +                                                              
+      591 +For a quick path to multi-node without a full rewrite, the key
+          + insight is: **the data plane (Mooncake) already works cross-n
+          +ode — only the control plane is missing.**                    
+      592 +                                                              
+      593 +### 7.1 Minimal Architecture                                  
+      594 +                                                              
+      595 +```                                                           
+      596 +  Node A (Master)                        Node B (Worker)      
+      597 +  ┌──────────────────────────┐          ┌─────────────────────
+          +─────┐                                                        
+      598 +  │  vllm serve ... --stage-id 0       │  vllm serve ... --sta
+          +ge-id 1                                                       
+      599 +  │                          │          │                     
+          +     │                                                        
+      600 +  │  API Server (:8000)      │          │  NO API Server      
+          +     │                                                        
+      601 +  │  Orchestrator            │          │  Stage 1 Engine only
+          +     │                                                        
+      602 +  │  Stage 0 Engine          │          │                     
+          +     │                                                        
+      603 +  │       │                  │          │       ▲             
+          +     │                                                        
+      604 +  │       │ ZMQ control (:8091)────────────────┘              
+          +    │                                                         
+      605 +  │       │                  │          │                     
+          +     │                                                        
+      606 +  │       ▼                  │          │       ▼             
+          +     │                                                        
+      607 +  │  connector.put(KV)       │          │  connector.get(KV)  
+          +     │                                                        
+      608 +  └───────────┬──────────────┘          └───────────┬─────────
+          +─────┘                                                        
+      609 +              │                                     │         
+      610 +              │         ┌──────────────┐            │         
+      611 +              └────────▶│   Mooncake   │◀───────────┘         
+      612 +                        └──────────────┘                      
+      613 +```                                                           
+      614 +                                                              
+      615 +### 7.2 Minimal Change List                                   
+      616 +                                                              
+      617 +| # | Change | File | Lines of Code |                         
+      618 +|:--|:-------|:-----|:-------------|                          
+      619 +| 1 | Filter stages by `--stage-id` in `_resolve_stage_configs
+          +()` | `async_omni_engine.py` | ~10 |                          
+      620 +| 2 | Add `RemoteStageEngineCoreClient` (ZMQ DEALER/ROUTER) | 
+          +new file | ~150 |                                             
+      621 +| 3 | Orchestrator: if stage is remote, use remote client | `o
+          +rchestrator.py` | ~30 |                                       
+      622 +| 4 | Worker mode: skip API server when `--stage-id` + `-oma` 
+          +are set | `serve.py`, `api_server.py` | ~20 |                 
+      623 +| 5 | Worker startup: connect to master, register stage | `ser
+          +ve.py` | ~40 |                                                
+      624 +| **Total** | | | **~250 lines** |                            
+      625 +                                                              
+      626 +### 7.3 What You Get                                          
+      627 +                                                              
+      628 +- Stage 0 on Node A, Stage 1 on Node B — each loading only its
+          + own model                                                    
+      629 +- KV cache transferred via Mooncake (already works)           
+      630 +- Control plane via ZMQ between Orchestrator and remote stage 
+      631 +- API endpoint only on Node A                                 
+      632 +                                                              
+      633 +### 7.4 What You Don't Get (Future Work)                      
+      634 +                                                              
+      635 +- Auto-discovery (stages must be manually started in order)   
+      636 +- Failover / health monitoring                                
+      637 +- Dynamic scaling (fixed 1:1 stage-to-node mapping)           
+      638 +                                                              
+      639 +---                                                           
+      640 +                                                              
+      641 +## 8. Approach B: Kubernetes-Native Orchestration             
+      642 +                                                              
+      643 +For production multi-node deployment, Kubernetes provides the 
+          +infrastructure that the codebase currently lacks: service disc
+          +overy, lifecycle management, and scaling.                     
+      644 +                                                              
+      645 +### 8.1 Architecture                                          
+      646 +                                                              
+      647 +```                                                           
+      648 +┌─────────────────────── Kubernetes Cluster ──────────────────
+          +─────┐                                                        
+      649 +│                                                             
+          +       │                                                      
+      650 +│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────
+          +┐   │                                                         
+      651 +│  │ Mooncake     │  │ Stage 0 Pod  │  │ Stage 1 Pod          
+          +│   │                                                         
+      652 +│  │ Master Pod   │  │              │  │                      
+          +│   │                                                         
+      653 +│  │              │  │ Container:   │  │ Container:           
+          +│   │                                                         
+      654 +│  │ :50051 gRPC  │  │  vllm serve  │  │  vllm serve          
+          +│   │                                                         
+      655 +│  │ :8080  HTTP  │  │  --stage-id 0│  │  --stage-id 1        
+          +│   │                                                         
+      656 +│  │              │  │  -oma self   │  │  -oma stage-0-svc    
+          +│   │                                                         
+      657 +│  │              │  │  -omp 8091   │  │  -omp 8091           
+          +│   │                                                         
+      658 +│  │              │  │  --port 8000 │  │  (no API server)     
+          +│   │                                                         
+      659 +│  │              │  │              │  │                      
+          +│   │                                                         
+      660 +│  │  Service:    │  │  Service:    │  │  (headless svc for   
+          +│   │                                                         
+      661 +│  │  mooncake-   │  │  stage-0-svc │  │   ZMQ discovery)     
+          +│   │                                                         
+      662 +│  │  master-svc  │  │  :8000 API   │  │                      
+          +│   │                                                         
+      663 +│  │              │  │  :8091 ctrl  │  │  Resources:          
+          +│   │                                                         
+      664 +│  │              │  │              │  │  nvidia.com/gpu: 1   
+          + │   │                                                        
+      665 +│  │              │  │  Resources:  │  │                      
+          +│   │                                                         
+      666 +│  │              │  │  nvidia/gpu:1│  │                      
+          +│   │                                                         
+      667 +│  └──────────────┘  └──────────────┘  └──────────────────────
+          +┘   │                                                         
+      668 +│                                                             
+          +       │                                                      
+      669 +│  ┌──────────────────────────────────────────────────────────
+          +┐    │                                                        
+      670 +│  │  Ingress / LoadBalancer                                  
+          + │    │                                                       
+      671 +│  │  External traffic → stage-0-svc:8000                     
+          + │    │                                                       
+      672 +│  └──────────────────────────────────────────────────────────
+          +┘    │                                                        
+      673 +└─────────────────────────────────────────────────────────────
+          +───────┘                                                      
+      674 +```                                                           
+      675 +                                                              
+      676 +### 8.2 Kubernetes Handles What's Missing                     
+      677 +                                                              
+      678 +| vllm-omni Gap | K8s Solution |                              
+      679 +|:-------------|:-------------|                               
+      680 +| Service discovery (where is Stage 1?) | K8s Service DNS: `st
+          +age-1-svc.namespace.svc.cluster.local` |                      
+      681 +| Health monitoring | Liveness/readiness probes on ZMQ or HTTP
+          + health endpoint |                                            
+      682 +| Startup ordering (Stage 0 before Stage 1) | `initContainers`
+          + or K8s Job dependencies |                                    
+      683 +| Failover | Pod restart policies + `ReplicaSet` |            
+      684 +| GPU scheduling | `nvidia.com/gpu` resource requests |       
+      685 +| Mooncake Master lifecycle | Separate Deployment + Service | 
+      686 +                                                              
+      687 +### 8.3 What Still Needs Code Changes                         
+      688 +                                                              
+      689 +Even with K8s, the **same P0 code gaps** from Section 6 apply:
+      690 +                                                              
+      691 +| Gap | K8s Helps? | Still Need Code? |                       
+      692 +|:----|:-----------|:-----------------|                       
+      693 +| Stage filtering by `--stage-id` | No | **Yes** — K8s sets en
+          +v/args, but engine must filter |                              
+      694 +| RemoteStageClient | No | **Yes** — K8s provides DNS, but cod
+          +e must use it |                                               
+      695 +| Orchestrator remote dispatch | No | **Yes** — core routing l
+          +ogic unchanged |                                              
+      696 +| Skip API server on workers | No | **Yes** — container args t
+          +rigger it, but code must support |                            
+      697 +| Service discovery | **Yes** — K8s DNS replaces OmniCoordinat
+          +or | Can skip OmniCoordinator |                               
+      698 +| Health checks | **Partially** — K8s probes, but need health 
+          +endpoint | Add `/health` endpoint |                           
+      699 +| Startup ordering | **Yes** — `initContainers` wait for Stage
+          + 0 | Minimal |                                                
+      700 +                                                              
+      701 +### 8.4 K8s-Specific Additions                                
+      702 +                                                              
+      703 +Beyond the P0 code changes, K8s-native support needs:         
+      704 +                                                              
+      705 +| Addition | Purpose |                                        
+      706 +|:---------|:--------|                                        
+      707 +| Helm chart or Kustomize manifests | Deploy Mooncake + Stage 
+          +0 + Stage 1 as a unit |                                       
+      708 +| `MOONCAKE_MASTER_ADDR` env var | Point all stages to `moonca
+          +ke-master-svc:50051` |                                        
+      709 +| `OMNI_MASTER_ADDR` env var | Point workers to `stage-0-svc:8
+          +091` |                                                        
+      710 +| Readiness probe on `-omp` port | Stage 0 ready when Orchestr
+          +ator is listening |                                           
+      711 +| GPU topology-aware scheduling | Place stages on nodes with r
+          +ight GPU types |                                              
+      712 +| Shared YAML ConfigMap | Mount `bagel_multiconnector.yaml` wi
+          +th K8s DNS addresses |                                        
+      713 +                                                              
+      714 +### 8.5 Example K8s Manifests (Sketch)                        
+      715 +                                                              
+      716 +**Mooncake Master:**                                          
+      717 +```yaml                                                       
+      718 +apiVersion: apps/v1                                           
+      719 +kind: Deployment                                              
+      720 +metadata:                                                     
+      721 +  name: mooncake-master                                       
+      722 +spec:                                                         
+      723 +  replicas: 1                                                 
+      724 +  template:                                                   
+      725 +    spec:                                                     
+      726 +      containers:                                             
+      727 +      - name: mooncake                                        
+      728 +        image: mooncake:latest                                
+      729 +        command: ["mooncake_master"]                          
+      730 +        args:                                                 
+      731 +          - "--rpc_port=50051"                                
+      732 +          - "--enable_http_metadata_server=true"              
+      733 +          - "--http_metadata_server_host=0.0.0.0"             
+      734 +          - "--http_metadata_server_port=8080"                
+      735 +        ports:                                                
+      736 +          - containerPort: 50051                              
+      737 +          - containerPort: 8080                               
+      738 +---                                                           
+      739 +apiVersion: v1                                                
+      740 +kind: Service                                                 
+      741 +metadata:                                                     
+      742 +  name: mooncake-master-svc                                   
+      743 +spec:                                                         
+      744 +  selector:                                                   
+      745 +    app: mooncake-master                                      
+      746 +  ports:                                                      
+      747 +    - name: grpc                                              
+      748 +      port: 50051                                             
+      749 +    - name: http                                              
+      750 +      port: 8080                                              
+      751 +```                                                           
+      752 +                                                              
+      753 +**Stage 0 (Thinker / Master):**                               
+      754 +```yaml                                                       
+      755 +apiVersion: apps/v1                                           
+      756 +kind: Deployment                                              
+      757 +metadata:                                                     
+      758 +  name: bagel-stage-0                                         
+      759 +spec:                                                         
+      760 +  replicas: 1                                                 
+      761 +  template:                                                   
+      762 +    spec:                                                     
+      763 +      containers:                                             
+      764 +      - name: vllm                                            
+      765 +        image: vllm-omni:latest                               
+      766 +        command: ["python", "-m", "vllm_omni.entrypoints.cli.s
+          +erve"]                                                        
+      767 +        args:                                                 
+      768 +          - "ByteDance-Seed/BAGEL-7B-MoT"                     
+      769 +          - "--omni"                                          
+      770 +          - "--port=8000"                                     
+      771 +          - "--stage-id=0"                                    
+      772 +          - "--stage-configs-path=/config/bagel_k8s.yaml"     
+      773 +          - "-oma=0.0.0.0"                                    
+      774 +          - "-omp=8091"                                       
+      775 +        ports:                                                
+      776 +          - containerPort: 8000  # API                        
+      777 +          - containerPort: 8091  # Control plane              
+      778 +        resources:                                            
+      779 +          limits:                                             
+      780 +            nvidia.com/gpu: 1                                 
+      781 +        volumeMounts:                                         
+      782 +          - name: config                                      
+      783 +            mountPath: /config                                
+      784 +          - name: model-cache                                 
+      785 +            mountPath: /root/.cache/huggingface               
+      786 +      volumes:                                                
+      787 +        - name: config                                        
+      788 +          configMap:                                          
+      789 +            name: bagel-stage-config                          
+      790 +        - name: model-cache                                   
+      791 +          persistentVolumeClaim:                              
+      792 +            claimName: model-cache-pvc                        
+      793 +---                                                           
+      794 +apiVersion: v1                                                
+      795 +kind: Service                                                 
+      796 +metadata:                                                     
+      797 +  name: stage-0-svc                                           
+      798 +spec:                                                         
+      799 +  selector:                                                   
+      800 +    app: bagel-stage-0                                        
+      801 +  ports:                                                      
+      802 +    - name: api                                               
+      803 +      port: 8000                                              
+      804 +    - name: control                                           
+      805 +      port: 8091                                              
+      806 +```                                                           
+      807 +                                                              
+      808 +**Stage 1 (DiT / Worker):**                                   
+      809 +```yaml                                                       
+      810 +apiVersion: apps/v1                                           
+      811 +kind: Deployment                                              
+      812 +metadata:                                                     
+      813 +  name: bagel-stage-1                                         
+      814 +spec:                                                         
+      815 +  replicas: 1                                                 
+      816 +  template:                                                   
+      817 +    spec:                                                     
+      818 +      initContainers:                                         
+      819 +      - name: wait-for-master                                 
+      820 +        image: busybox                                        
+      821 +        command: ['sh', '-c', 'until nc -z stage-0-svc 8091; d
+          +o sleep 2; done']                                             
+      822 +      containers:                                             
+      823 +      - name: vllm                                            
+      824 +        image: vllm-omni:latest                               
+      825 +        command: ["python", "-m", "vllm_omni.entrypoints.cli.s
+          +erve"]                                                        
+      826 +        args:                                                 
+      827 +          - "ByteDance-Seed/BAGEL-7B-MoT"                     
+      828 +          - "--omni"                                          
+      829 +          - "--stage-id=1"                                    
+      830 +          - "--stage-configs-path=/config/bagel_k8s.yaml"     
+      831 +          - "-oma=stage-0-svc"                                
+      832 +          - "-omp=8091"                                       
+      833 +        resources:                                            
+      834 +          limits:                                             
+      835 +            nvidia.com/gpu: 1                                 
+      836 +        volumeMounts:                                         
+      837 +          - name: config                                      
+      838 +            mountPath: /config                                
+      839 +          - name: model-cache                                 
+      840 +            mountPath: /root/.cache/huggingface               
+      841 +      volumes:                                                
+      842 +        - name: config                                        
+      843 +          configMap:                                          
+      844 +            name: bagel-stage-config                          
+      845 +        - name: model-cache                                   
+      846 +          persistentVolumeClaim:                              
+      847 +            claimName: model-cache-pvc                        
+      848 +```                                                           
+      849 +                                                              
+      850 +**ConfigMap for stage config (with K8s DNS addresses):**      
+      851 +```yaml                                                       
+      852 +apiVersion: v1                                                
+      853 +kind: ConfigMap                                               
+      854 +metadata:                                                     
+      855 +  name: bagel-stage-config                                    
+      856 +data:                                                         
+      857 +  bagel_k8s.yaml: |                                           
+      858 +    stage_args:                                               
+      859 +      - stage_id: 0                                           
+      860 +        stage_type: llm                                       
+      861 +        # ... (same as bagel_multiconnector.yaml)             
+      862 +        output_connectors:                                    
+      863 +          to_stage_1: mooncake_connector                      
+      864 +      - stage_id: 1                                           
+      865 +        stage_type: diffusion                                 
+      866 +        # ...                                                 
+      867 +        input_connectors:                                     
+      868 +          from_stage_0: mooncake_connector                    
+      869 +    runtime:                                                  
+      870 +      connectors:                                             
+      871 +        mooncake_connector:                                   
+      872 +          name: MooncakeStoreConnector                        
+      873 +          extra:                                              
+      874 +            host: "0.0.0.0"                                   
+      875 +            metadata_server: "http://mooncake-master-svc:8080/
+          +metadata"                                                     
+      876 +            master: "mooncake-master-svc:50051"               
+      877 +            segment: 512000000                                
+      878 +            proto: "tcp"                                      
+      879 +      edges:                                                  
+      880 +        - from: 0                                             
+      881 +          to: 1                                               
+      882 +```                                                           
+      883 +                                                              
+      884 +### 8.6 Comparison: Approach A vs B                           
+      885 +                                                              
+      886 +| Aspect | A: Minimal Changes | B: Kubernetes-Native |        
+      887 +|:-------|:-------------------|:---------------------|        
+      888 +| **Code changes** | ~250 lines | ~250 lines + Helm chart |   
+      889 +| **Service discovery** | Manual (start Stage 0 first) | K8s D
+          +NS automatic |                                                
+      890 +| **Failover** | None | Pod restart + readiness probes |      
+      891 +| **Scaling** | Fixed 1:1 | ReplicaSet (future: HPA) |        
+      892 +| **GPU scheduling** | Manual device assignment | K8s GPU sche
+          +duler |                                                       
+      893 +| **Startup ordering** | Manual | `initContainers` |          
+      894 +| **Best for** | Dev/testing, single cluster | Production, mul
+          +ti-tenant |                                                   
+      895 +                                                              
+      896 +**Recommendation:** The P0 code changes (Section 6.2–6.4) are 
+          +identical for both approaches. Start with Approach A to valida
+          +te the control plane, then wrap it with K8s manifests for Appr
+          +oach B. The code doesn't need to be "K8s-aware" — K8s handles 
+          +the infra; the code just needs to support `--stage-id` filteri
+          +ng and remote stage communication.                            
+      897 +                                                              
+      898 +---                                                           
+      899 +                                                              
+      900 +## 9. Related Documents                                       
+      901 +                                                              
+      902  - [Disaggregated Inference](disaggregated_inference.md) — Conn
+           ector API and configuration model
+      903  - [Ray-based Execution](ray_based_execution.md) — Ray cluster 
+           setup and `--worker-backend ray`
+      904  - [MooncakeStoreConnector](omni_connectors/mooncake_store_conn
+           ector.md) — TCP/store-based connector design
+     ...
+      906  - [SharedMemoryConnector](omni_connectors/shared_memory_connec
+           tor.md) — Single-node connector
+      907  - [Architecture Overview](../architecture_overview.md) — vllm-
+           omni high-level design
+      908  - [RFC #1192: Full Disaggregation Roadmap](https://github.com/
+           vllm-project/vllm-omni/issues/1192) — Q1 2026 roadmap
+      909 +                                                              
+      910 +- [Disaggregated Inference](disaggregated_inference.md) — Conn
+          +ector API and configuration model                             
+      911 +- [Ray-based Execution](ray_based_execution.md) — Ray cluster 
+          +setup and `--worker-backend ray`                              
+      912 +- [MooncakeStoreConnector](omni_connectors/mooncake_store_conn
+          +ector.md) — TCP/store-based connector design                  
+      913 +- [MooncakeTransferEngineConnector](omni_connectors/mooncake_t
+          +ransfer_engine_connector.md) — RDMA connector design          
+      914 +- [SharedMemoryConnector](omni_connectors/shared_memory_connec
+          +tor.md) — Single-node connector                               
+      915 +- [Architecture Overview](../architecture_overview.md) — vllm-
+          +omni high-level design                                        
+      916 +- [RFC #1192: Full Disaggregation Roadmap](https://github.com/
+          +vllm-project/vllm-omni/issues/1192) — Q1 2026 roadmap         
+
+⏺ Update the table of contents to reflect new sections.
+
+⏺ Update(docs/design/feature/bagel_multinode_deployment.md)
+  ⎿  Added 4 lines, removed 1 line
+       9  - [3. Stage Allocation Across Nodes](#3-stage-allocation-across
+          -nodes)
+      10  - [4. Ray: Current Status and Roadmap](#4-ray-current-status-an
+          d-roadmap)
+      11  - [5. Full Disaggregation Roadmap (EPDG)](#5-full-disaggregatio
+          n-roadmap-epdg)
+      12 -- [6. Related Documents](#6-related-documents)                 
+      12 +- [6. Gap Analysis: What's Missing for True Multi-Node](#6-gap-
+         +analysis-whats-missing-for-true-multi-node)                    
+      13 +- [7. Approach A: Minimal Changes to Make It Work](#7-approach-
+         +a-minimal-changes-to-make-it-work)                             
+      14 +- [8. Approach B: Kubernetes-Native Orchestration](#8-approach-
+         +b-kubernetes-native-orchestration)                             
+      15 +- [9. Related Documents](#9-related-documents)                 
+      16  
+      17  ---
+      18  
+
+⏺ Doc updated. Here's the summary for your two questions:
+
+  Where are the gaps?
+
+  The data plane (Mooncake KV transfer) already works cross-node. The gaps are
+  all in the control plane:
+
+  ┌────────────────────────────────┬────────────────────────────────────────┐
+  │              Gap               │             Why it blocks              │
+  ├────────────────────────────────┼────────────────────────────────────────┤
+  │ --stage-id doesn't filter      │ Each node loads ALL stages instead of  │
+  │ stages                         │ just its own                           │
+  ├────────────────────────────────┼────────────────────────────────────────┤
+  │ No RemoteStageEngineCoreClient │ Orchestrator can't talk to a stage on  │
+  │                                │ another node                           │
+  ├────────────────────────────────┼────────────────────────────────────────┤
+  │ Orchestrator assumes local     │ self.stage_clients[1] doesn't exist if │
+  │ stages                         │  Stage 1 is remote                     │
+  ├────────────────────────────────┼────────────────────────────────────────┤
+  │ --headless is broken           │ Worker nodes can't skip the API server │
+  └────────────────────────────────┴────────────────────────────────────────┘
+
+  All ~250 lines of code changes. The OmniCoordinator is already built but not
+  wired in.
+
+  Your two options:
+
+  Approach A (minimal): Fix the 4 gaps above. Stage 0 starts first, Stage 1
+  connects to it via -oma/-omp. Manual startup ordering, no auto-discovery. Good
+   for dev/testing.
+
+  Approach B (K8s-native): Same code changes + Helm charts. K8s DNS replaces
+  OmniCoordinator for service discovery, initContainers handles startup
+  ordering, GPU scheduling is automatic. The code itself doesn't need to be
+  K8s-aware — K8s just provides the infra.
+
+  My recommendation: Start with Approach A to validate the control plane works,
+  then wrap with K8s manifests. The P0 code changes are identical for both.
+
+✻ Cooked for 10m 53s
+
+❯ I think approach A is anyway needed to make the engine work to support        
+distribtued pattern, approach b is additional work to make it better run on     
+kubernetes. there's no conflict, right?                                         
+
+⏺ Exactly right. No conflict at all — Approach A is the foundation, Approach B
+  is the infra layer on top.
+
+    Approach B (K8s manifests, DNS, probes)
+    ┌──────────────────────────────────────┐
+    │  Helm chart, Services, initContainers │
+    │  ─── uses the same CLI args ───       │
+    └──────────────────────────────────────┘
+                      ▲
+                      │  wraps
+                      │
+    Approach A (engine code changes)
+    ┌──────────────────────────────────────┐
+    │  --stage-id filtering                 │
+    │  RemoteStageClient                    │
+    │  Orchestrator remote dispatch         │
+    │  Worker mode (skip API server)        │
+    └──────────────────────────────────────┘
+
+  A makes the engine capable. B makes it convenient to deploy. Let me update the
+   doc to clarify this relationship.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(docs/design/feature/bagel_multinode_deployment.md)
+  ⎿  Added 27 lines, removed 7 lines
+      884            to: 1
+      885  ```
+      886  
+      887 -### 8.6 Comparison: Approach A vs B                           
+      887 +### 8.6 Relationship: A is Foundation, B is Infra Layer       
+      888  
+      889 -| Aspect | A: Minimal Changes | B: Kubernetes-Native |        
+      890 -|:-------|:-------------------|:---------------------|        
+      891 -| **Code changes** | ~250 lines | ~250 lines + Helm chart |   
+      889 +Approach A and B are **not alternatives** — they are **layers*
+          +*. A is the engine-level capability that makes distributed sta
+          +ges possible. B is the infrastructure layer that makes it easy
+          + to deploy and operate.                                       
+      890 +                                                              
+      891 +```                                                           
+      892 +  ┌──────────────────────────────────────────────────┐        
+      893 +  │  Approach B: Kubernetes Infra Layer              │        
+      894 +  │  (Helm chart, DNS discovery, probes, GPU sched)  │        
+      895 +  │                                                    │      
+      896 +  │  ─── uses the same CLI args from Approach A ───   │       
+      897 +  └──────────────────────────────────────────────────┘        
+      898 +                        ▲                                     
+      899 +                        │ wraps (no conflict)                 
+      900 +                        │                                     
+      901 +  ┌──────────────────────────────────────────────────┐        
+      902 +  │  Approach A: Engine Code Changes                 │        
+      903 +  │  (--stage-id filtering, RemoteStageClient,       │        
+      904 +  │   Orchestrator remote dispatch, worker mode)     │        
+      905 +  └──────────────────────────────────────────────────┘        
+      906 +```                                                           
+      907 +                                                              
+      908 +| Aspect | A: Engine Changes | B: K8s Layer |                 
+      909 +|:-------|:-----------------|:-------------|                  
+      910 +| **What it does** | Makes the engine capable of distributed s
+          +tages | Makes distributed stages easy to deploy |             
+      911 +| **Code changes** | ~250 lines in vllm-omni | Helm chart + ma
+          +nifests (no engine changes) |                                 
+      912 +| **Required?** | **Yes** — prerequisite for any multi-node | 
+          +Optional — one of many deployment targets |                   
+      913  | **Service discovery** | Manual (start Stage 0 first) | K8s D
+           NS automatic |
+      914  | **Failover** | None | Pod restart + readiness probes |
+      894 -| **Scaling** | Fixed 1:1 | ReplicaSet (future: HPA) |        
+      915  | **GPU scheduling** | Manual device assignment | K8s GPU sche
+           duler |
+      916  | **Startup ordering** | Manual | `initContainers` |
+      897 -| **Best for** | Dev/testing, single cluster | Production, mul
+          -ti-tenant |                                                   
+      917 +| **Can run without the other?** | Yes (bare metal, VMs) | No 
+          +— needs A first |                                             
+      918  
+      899 -**Recommendation:** The P0 code changes (Section 6.2–6.4) are 
+          -identical for both approaches. Start with Approach A to valida
+          -te the control plane, then wrap it with K8s manifests for Appr
+          -oach B. The code doesn't need to be "K8s-aware" — K8s handles 
+          -the infra; the code just needs to support `--stage-id` filteri
+          -ng and remote stage communication.                            
+      919 +**Implementation order:** Approach A first (engine capability)
+          +, then Approach B (K8s manifests). The engine code is infrastr
+          +ucture-agnostic — it works on bare metal, VMs, or K8s. K8s jus
+          +t provides the operational layer.                             
+      920  
+      921  ---
+      922  
+
+⏺ Done. The doc now clearly states they're layered — A is the prerequisite
+  engine work, B wraps it for K8s. No conflict.
+
+✻ Crunched for 37s
+
+❯ can you help search https://github.com/vllm-project/vllm-omni/issues and      
+https://github.com/vllm-project/vllm-omni/pulls and see if there                
+
+⏺ Your message got cut off — "see if there..." — but I can guess you want me to
+  find related issues/PRs about multi-node, distributed stages, or K8s. Let me
+  search.
+
+⏺ Bash(gh search issues --repo vllm-project/vllm-omni --limit 30 "multi-node OR
+      distributed OR disaggregat OR kubernetes OR k8s OR headless OR stage-id"
+      --json number,…)
+  ⎿  Error: Exit code 1
+     Expecting value: line 1 column 1 (char 0)
+
+⏺ Bash(gh search prs --repo vllm-project/vllm-omni --limit 30 "multi-node OR
+      distributed OR disaggregat OR headless OR remote stage OR stage-id" --json
+       number,title,st…)
+  ⎿  Cancelled: parallel tool call Bash(gh search issues --repo 
+     vllm-project/vll…) errored
+
+⏺ Bash(gh search issues --repo vllm-project/vllm-omni --limit 20 "mooncake OR
+      RDMA OR connector OR cross-node" --json number,title,state,url 2>/dev/null
+       | python -m js…)
+  ⎿  Cancelled: parallel tool call Bash(gh search issues --repo 
+     vllm-project/vll…) errored
+
+⏺ Bash(gh search prs --repo vllm-project/vllm-omni --limit 20 "mooncake OR RDMA
+      OR connector OR cross-node" --json number,title,state,url 2>/dev/null |
+      python -m json.…)
+  ⎿  Cancelled: parallel tool call Bash(gh search issues --repo 
+     vllm-project/vll…) errored
+
+⏺ Bash(gh issue list --repo vllm-project/vllm-omni --limit 50 --search
+      "multi-node OR distributed OR disaggregat OR kubernetes OR headless OR
+      stage-id OR mooncake OR R…)
+  ⎿  []
+
+⏺ Bash(gh pr list --repo vllm-project/vllm-omni --limit 50 --search "multi-node
+      OR distributed OR disaggregat OR headless OR stage-id OR mooncake OR RDMA
+      OR connector"…)
+  ⎿  []
+
+⏺ Bash(gh issue list --repo vllm-project/vllm-omni --limit 100 --state open
+      --json number,title,url | python -c "
+      import json, sys…)  ⎿  #2003: [New Model] AudioX (Multimodal Audio Generation)
+       https://github.com/vllm-project/vllm-omni/issues/2003
+     #1940: [RFC]: NCCL-Based Connector for Inter-Stage Communication
+     … +31 lines (ctrl+o to expand)
+
+⏺ Bash(gh pr list --repo vllm-project/vllm-omni --limit 100 --state open --json
+      number,title,url | python -c "
+      import json, sys…)
+  ⎿  #2040: [Doc] Clarify POST /v1/videos accepts multipart/form-data, not
+     JSON
+       https://github.com/vllm-project/vllm-omni/pull/2040
+     … +22 lines (ctrl+o to expand)
+
+⏺ Good finds. Let me fetch the most relevant ones to understand what's actively
+  in progress.
+
+⏺ Bash(gh issue view 1823 --repo vllm-project/vllm-omni --json
+      title,body,state,comments --jq '{title,state,body:
+      (.body[:2000]),comment_count: (.comments|length)}')
+  ⎿  {"body":"\n# 1 Overview\n\nAdd `MooncakeTransferEngineConnector` suppo
+     rt to the separated Bagel `AR -\u003e DiT` pipeline, covering `text2im
+     g`, `img2img`, and CFG, with optional packed-KV fast path.\n\n## 1.1 M
+     … +28 lines (ctrl+o to expand)
+
+⏺ Bash(gh pr view 2006 --repo vllm-project/vllm-omni --json
+      title,body,state,headRefName --jq '{title,state,branch: .headRefName,body:
+       (.body[:2000]}')
+  ⎿  Cancelled: parallel tool call Bash(gh pr view 2000 --repo 
+     vllm-project/vllm…) errored
+
+⏺ Bash(gh issue view 1940 --repo vllm-project/vllm-omni --json title,body,state
+      --jq '{title,state,body: (.body[:2000])}')
+  ⎿  Cancelled: parallel tool call Bash(gh pr view 2000 --repo 
+     vllm-project/vllm…) errored
+
+⏺ Bash(gh issue view 1792 --repo vllm-project/vllm-omni --json title,body,state
+      --jq '{title,state,body: (.body[:2000])}')
+  ⎿  Cancelled: parallel tool call Bash(gh pr view 2000 --repo 
+     vllm-project/vllm…) errored
+
+⏺ Bash(gh pr view 1988 --repo vllm-project/vllm-omni --json
+      title,body,state,headRefName --jq '{title,state,branch: .headRefName,body:
+       (.body[:2000]}')
+  ⎿  Cancelled: parallel tool call Bash(gh pr view 2000 --repo 
+     vllm-project/vllm…) errored
+
+⏺ Bash(gh issue view 1867 --repo vllm-project/vllm-omni --json title,body,state
+      --jq '{title,state,body: (.body[:2000])}')
+  ⎿  Cancelled: parallel tool call Bash(gh pr view 2000 --repo 
+     vllm-project/vllm…) errored
+
+⏺ Bash(gh pr view 2000 --repo vllm-project/vllm-omni --json
+      title,body,state,headRefName --jq '{title,state,branch: .headRefName,body:
+       (.body[:2000]}')
+  ⎿  Error: Exit code 1
+     failed to parse jq expression (line 1, column 54)
+         {title,state,branch: .headRefName,body: (.body[:2000]}
+                                                              ^  unexpected 
+     token "}"
+
+⏺ Bash(gh pr view 2020 --repo vllm-project/vllm-omni --json
+      title,body,state,headRefName --jq '{title,state,branch: .headRefName,body:
+       (.body[:2000]}')
+  ⎿  Cancelled: parallel tool call Bash(gh pr view 2000 --repo 
+     vllm-project/vllm…) errored
+
+⏺ Bash(gh pr view 2000 --repo vllm-project/vllm-omni --json
+      title,body,state,headRefName --jq '{title,state,branch: .headRefName,body:
+       (.body[:2000])}')
+  ⎿  {
+       "body": "## Purpose\r\n\r\n- rebase the Bagel RDMA flow onto the cur
+     rent `main`\r\n- preserve RDMA sender bootstrap after the orchestrator
+     … +6 lines (ctrl+o to expand)
+
+⏺ Bash(gh pr view 2020 --repo vllm-project/vllm-omni --json
+      title,body,state,headRefName --jq '{title,state,branch: .headRefName,body:
+       (.body[:2000])}')
+  ⎿  {"body":"\u003c!-- markdownlint-disable --\u003e\r\nPLEASE FILL IN THE
+      PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTTOM) HAVE
+      BEEN CONSIDERED.\r\n\r\n## Purpose\r\n\r\n## Test Plan\r\n\r\n## Test
+     … +19 lines (ctrl+o to expand)
+
+⏺ Bash(gh issue view 1940 --repo vllm-project/vllm-omni --json title,body,state
+      --jq '{title,state,body: (.body[:2000])}')
+  ⎿  {
+       "body": "### Motivation.\n\n## Summary\n\nThis RFC proposes adding `
+     NCCLConnector`, a new `OmniConnectorBase` implementation\nthat transfe
+     … +28 lines (ctrl+o to expand)
+
+⏺ Bash(gh issue view 1867 --repo vllm-project/vllm-omni --json title,body,state
+      --jq '{title,state,body: (.body[:2000])}')
+  ⎿  {
+       "body": "### Motivation.\n\n\nThis document serves as a progress sum
+     mary and tracking hub for [#1150 - Support KV Cache CPU Offloading](ht
+     … +28 lines (ctrl+o to expand)
+
+⏺ Bash(gh issue view 1902 --repo vllm-project/vllm-omni --json title,body,state
+      --jq '{title,state,body: (.body[:1500])}')
+  ⎿  {
+       "body": "## Summary\n`OmniCoordClientForStage` has several failure-p
+     ath and lifecycle edge cases that can desynchronize stage liveness sta
+     … +22 lines (ctrl+o to expand)
+
+⏺ Bash(gh pr view 2006 --repo vllm-project/vllm-omni --json
+      title,body,state,headRefName --jq '{title,state,branch: .headRefName,body:
+       (.body[:2000])}')
+  ⎿  {"body":"as an part of the answer of #967  vLLM-Omni Entrypoint Refact
+     oring\r\n\r\nThe actual stage's inferences has to be ran in a subproce
+     ss that different from the process of AsyncOmni\r\n\r\n## Purpose\r\n\
+     … +27 lines (ctrl+o to expand)
+
+⏺ Bash(gh issue view 1792 --repo vllm-project/vllm-omni --json title,body,state
+      --jq '{title,state,body: (.body[:2000])}')
+  ⎿  {
+       "body": "### Motivation.\n\nDisclosure: this RFC is authored with he
+     lp from AI.\n\nvLLM-Omni already uses on Ray for distributed inference
+     … +28 lines (ctrl+o to expand)
+
+⏺ Bash(gh pr view 1988 --repo vllm-project/vllm-omni --json
+      title,body,state,headRefName --jq '{title,state,branch: .headRefName,body:
+       (.body[:2000])}')
+  ⎿  {
+       "body": "\r\n## Purpose\r\n\r\n\r\n\r\nAdd a Ray-based distributed e
+     xecutor for diffusion models, enabling multi-node GPU execution. Resol
+     … +30 lines (ctrl+o to expand)
+
+⏺ Here's what's actively in progress that's directly relevant to our multi-node
+  BAGEL work:
+
+  ---
+  Directly Related PRs (Open, In Progress)
+
+  PR: #2000
+  Title: WIP: Port Bagel RDMA flow to latest main
+  Relevance: Rebasing MooncakeTransferEngineConnector onto current main for
+    BAGEL. This is the P0 RDMA work from RFC #1192.
+  ────────────────────────────────────────
+  PR: #2020
+  Title: [Entrypoint][Refactor] Stage CLI Refactor
+  Relevance: Refactoring the CLI stage arguments — directly touches --stage-id,
+    -oma, -omp. This could be wiring up our Gap 1 (stage filtering).
+  ────────────────────────────────────────
+  PR: #2006
+  Title: [WIP] Refactor StageDiffusionClient and StageEngineCoreClient
+  Relevance: Moving stage inference into ZMQ-connected subprocesses
+    (StageDiffusionProc, StageEngineCoreProc). This is a prerequisite  for Gap 3
+
+    (RemoteStageClient) — once stages talk via ZMQ, switching from local to
+    remote ZMQ is straightforward.
+  ────────────────────────────────────────
+  PR: #1988
+  Title: [Diffusion] Add Ray executor backend for distributed execution
+  Relevance: RayDiffusionExecutor for multi-node GPU execution within a single
+    DiT stage (TP/SP). Not cross-stage, but enables Stage 1 to span multiple
+    GPUs/nodes.
+  ────────────────────────────────────────
+  PR: #1899
+  Title: [Bugfix] Prevent Silent Stage Dropouts (OmniCoordinator)
+  Relevance: Fixing coordinator reconnect bugs, heartbeat stalls — hardening the
+
+    Gap 7 infrastructure (OmniCoordinator).
+
+  Directly Related RFCs (Open Issues)
+
+  ┌───────┬────────────────────────┬────────────────────────────────────────┐
+  │ Issue │         Title          │               Relevance                │
+  ├───────┼────────────────────────┼────────────────────────────────────────┤
+  │ #1192 │ Full Disaggregation    │ The master roadmap — already in our    │
+  │       │ Roadmap Q1 2026        │ doc                                    │
+  ├───────┼────────────────────────┼────────────────────────────────────────┤
+  │       │ Mooncake Transfer      │ Detailed RFC for RDMA on BAGEL —       │
+  │ #1823 │ Engine for Bagel       │ covers CFG multi-KV, img2img metadata, │
+  │       │ AR/DiT disaggregation  │  port separation. PR #2000 implements  │
+  │       │                        │ this.                                  │
+  ├───────┼────────────────────────┼────────────────────────────────────────┤
+  │       │ NCCL-Based Connector   │ Proposes GPU-direct NCCL connector —   │
+  │ #1940 │ for Inter-Stage        │ zero CPU copy, zero SM usage.          │
+  │       │ Communication          │ Alternative to Mooncake for same-node  │
+  │       │                        │ or NVLink/IB connected nodes.          │
+  ├───────┼────────────────────────┼────────────────────────────────────────┤
+  │       │                        │ Ray object store as connector backend  │
+  │ #1792 │ Ray Connector          │ — no Mooncake needed if you already    │
+  │       │                        │ have a Ray cluster. Uses Ray Direct    │
+  │       │                        │ Transport (RDT) for RDMA-level perf.   │
+  ├───────┼────────────────────────┼────────────────────────────────────────┤
+  │       │                        │ CPU offloading, LMCache integration,   │
+  │ #1867 │ Multi-Stage KV Cache   │ cross-stage KV reuse. Broader KV       │
+  │       │ Management Roadmap     │ management that builds on top of our   │
+  │       │                        │ connector work.                        │
+  ├───────┼────────────────────────┼────────────────────────────────────────┤
+  │       │ OmniCoordinator        │ Documents coordinator failure modes —  │
+  │ #1902 │ liveness desync bug    │ relevant when we wire it in (Gap 7).   │
+  │       │                        │ PR #1899 fixes the known issues.       │
+  └───────┴────────────────────────┴────────────────────────────────────────┘
+
+  Key Takeaway
+
+  PR #2020 (Stage CLI Refactor) and #2006 (StageClient Refactor) are the ones 
+  most directly overlapping with Approach A. Before writing code, you should
+  check those PRs to avoid duplicating effort:
+
+  - #2020 may already be wiring --stage-id filtering
+  - #2006 is decoupling stage inference into ZMQ subprocesses — which is the
+  stepping stone to RemoteStageClient
+
+  Want me to add these references to the doc?
+
+✻ Brewed for 1m 38s
+
+❯ ye                                                                            
+
+  Read 1 file (ctrl+o to expand)
+⏺ I see there's a duplicate Related Documents section. Let me fix that and add
+  the in-progress references.
+
+⏺ Update(docs/design/feature/bagel_multinode_deployment.md)
+  ⎿  Added 33 lines, removed 9 lines
+      920  
+      921  ---
+      922  
+      923 -## 9. Related Documents                                       
+      923 +## 9. In-Progress Work (as of 2026-03-20)                     
+      924  
+      925 -- [Disaggregated Inference](disaggregated_inference.md) — Conn
+          -ector API and configuration model                             
+      926 -- [Ray-based Execution](ray_based_execution.md) — Ray cluster 
+          -setup and `--worker-backend ray`                              
+      927 -- [MooncakeStoreConnector](omni_connectors/mooncake_store_conn
+          -ector.md) — TCP/store-based connector design                  
+      928 -- [MooncakeTransferEngineConnector](omni_connectors/mooncake_t
+          -ransfer_engine_connector.md) — RDMA connector design          
+      929 -- [SharedMemoryConnector](omni_connectors/shared_memory_connec
+          -tor.md) — Single-node connector                               
+      930 -- [Architecture Overview](../architecture_overview.md) — vllm-
+          -omni high-level design                                        
+      931 -- [RFC #1192: Full Disaggregation Roadmap](https://github.com/
+          -vllm-project/vllm-omni/issues/1192) — Q1 2026 roadmap         
+      925 +Before starting implementation, check these active PRs and RFC
+          +s — they directly overlap with the gaps identified in this doc
+          +ument.                                                        
+      926  
+      927 +### Active PRs                                                
+      928 +                                                              
+      929 +| PR | Title | Overlaps With | Status |                       
+      930 +|:---|:------|:-------------|:-------|                        
+      931 +| [#2020](https://github.com/vllm-project/vllm-omni/pull/2020)
+          + | **Stage CLI Refactor** | Gap 1 (stage filtering), Gap 6 (he
+          +adless/worker mode) — refactoring `--stage-id`, `-oma`, `-omp`
+          + handling | Open, WIP |                                       
+      932 +| [#2006](https://github.com/vllm-project/vllm-omni/pull/2006)
+          + | **Refactor StageDiffusionClient and StageEngineCoreClient**
+          + | Gap 3 (RemoteStageClient) — moves stage inference into ZMQ-
+          +connected subprocesses (`StageDiffusionProc`, `StageEngineCore
+          +Proc`). Once stages talk via ZMQ, switching from local→remote 
+          +ZMQ is straightforward. | Open, WIP |                         
+      933 +| [#2000](https://github.com/vllm-project/vllm-omni/pull/2000)
+          + | **Port Bagel RDMA flow to latest main** | Section 2.4 — reb
+          +asing `MooncakeTransferEngineConnector` for BAGEL onto current
+          + main. P0 RDMA work from RFC #1192. | Open, WIP |             
+      934 +| [#1988](https://github.com/vllm-project/vllm-omni/pull/1988)
+          + | **Ray executor backend for diffusion** | Section 4 — `RayDi
+          +ffusionExecutor` for multi-node GPU within a single DiT stage 
+          +(TP/SP). Not cross-stage, but enables Stage 1 to span multiple
+          + GPUs/nodes. | Open |                                         
+      935 +| [#1899](https://github.com/vllm-project/vllm-omni/pull/1899)
+          + | **Fix OmniCoordinator reconnect/heartbeat bugs** | Gap 7 — 
+          +hardening the coordinator before wiring it in. Fixes reconnect
+          +, close/update race, heartbeat stall. | Open |                
+      936 +                                                              
+      937 +### Active RFCs                                               
+      938 +                                                              
+      939 +| Issue | Title | Relevance |                                 
+      940 +|:------|:------|:----------|                                 
+      941 +| [#1192](https://github.com/vllm-project/vllm-omni/issues/119
+          +2) | **Full Disaggregation Roadmap Q1 2026** | Master roadmap 
+          +— EPDG, native worker actor, communication refactor |         
+      942 +| [#1823](https://github.com/vllm-project/vllm-omni/issues/182
+          +3) | **Mooncake Transfer Engine for Bagel AR/DiT** | Detailed 
+          +RDMA RFC — covers CFG multi-KV correctness, img2img metadata, 
+          +port namespace separation. PR #2000 implements this. |        
+      943 +| [#1940](https://github.com/vllm-project/vllm-omni/issues/194
+          +0) | **NCCL-Based Connector** | GPU-direct inter-stage connect
+          +or — zero CPU copy via NCCL put/wait. Alternative to Mooncake 
+          +for NVLink/IB connected nodes. |                              
+      944 +| [#1792](https://github.com/vllm-project/vllm-omni/issues/179
+          +2) | **Ray Connector** | Ray object store as connector — elimi
+          +nates Mooncake dependency if Ray cluster exists. Uses Ray Dire
+          +ct Transport (RDT) for RDMA-level perf. |                     
+      945 +| [#1867](https://github.com/vllm-project/vllm-omni/issues/186
+          +7) | **Multi-Stage KV Cache Management Roadmap** | CPU offload
+          +ing, LMCache, cross-stage KV reuse. Builds on top of connector
+          + work. |                                                      
+      946 +| [#1902](https://github.com/vllm-project/vllm-omni/issues/190
+          +2) | **OmniCoordinator liveness desync bug** | Coordinator fai
+          +lure modes — relevant when wiring Gap 7. PR #1899 fixes known 
+          +issues. |                                                     
+      947 +                                                              
+      948 +### Coordination Notes                                        
+      949 +                                                              
+      950 +- **PR #2020 + #2006 are the critical ones to track** — they d
+          +irectly address Gaps 1, 3, and 6. Coordinate with those author
+          +s before starting Approach A to avoid duplicate work.         
+      951 +- **PR #2000** is orthogonal (data plane RDMA) and can proceed
+          + independently from control plane work.                       
+      952 +- **RFC #1792 (Ray Connector)** could eventually replace Moonc
+          +ake for teams already on Ray, making the K8s deployment simple
+          +r (no Mooncake Master pod needed).                            
+      953 +                                                              
+      954 +---                                                           
+      955 +                                                              
+      956 +## 10. Related Documents                                      
+      957 +                                                              
+      958  - [Disaggregated Inference](disaggregated_inference.md) — Conn
+           ector API and configuration model
+      959  - [Ray-based Execution](ray_based_execution.md) — Ray cluster 
+           setup and `--worker-backend ray`
+      960  - [MooncakeStoreConnector](omni_connectors/mooncake_store_conn
+           ector.md) — TCP/store-based connector design
+      961  - [MooncakeTransferEngineConnector](omni_connectors/mooncake_t
+           ransfer_engine_connector.md) — RDMA connector design
+      962  - [SharedMemoryConnector](omni_connectors/shared_memory_connec
+           tor.md) — Single-node connector
+      963  - [Architecture Overview](../architecture_overview.md) — vllm-
+           omni high-level design
+      939 -- [RFC #1192: Full Disaggregation Roadmap](https://github.com/
+          -vllm-project/vllm-omni/issues/1192) — Q1 2026 roadmap         
+
+⏺ Update the TOC to match.
+
+⏺ Update(docs/design/feature/bagel_multinode_deployment.md)
+  ⎿  Added 2 lines, removed 1 line
+      12  - [6. Gap Analysis: What's Missing for True Multi-Node](#6-gap-
+          analysis-whats-missing-for-true-multi-node)
+      13  - [7. Approach A: Minimal Changes to Make It Work](#7-approach-
+          a-minimal-changes-to-make-it-work)
+      14  - [8. Approach B: Kubernetes-Native Orchestration](#8-approach-
+          b-kubernetes-native-orchestration)
+      15 -- [9. Related Documents](#9-related-documents)                 
+      15 +- [9. In-Progress Work](#9-in-progress-work-as-of-2026-03-20)  
+      16 +- [10. Related Documents](#10-related-documents)               
+      17  
+      18  ---
+      19  
+
+⏺ Done. Added Section 9 with all the active PRs and RFCs, mapped to which gaps
+  they address. Key callout:
+
+  - PR #2020 (Stage CLI Refactor) and #2006 (StageClient Refactor) are the two
+  to coordinate with before starting Approach A — they directly overlap with
+  Gaps 1, 3, and 6.
+  - PR #2000 (Bagel RDMA) is orthogonal data plane work, no conflict.
+  - Also fixed a duplicate Related Documents section that had crept in.
+
+❯ what's the best model to test? it should be supported in vllm-omni, it should 
+ have multiple stages? 2 stages at leat, it should be small, iteration is fast  
+and I can also use small GPU to host it                                         
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ Explore(Find small multi-stage models)
+  ⎿  Done (33 tool uses · 70.8k tokens · 41s)
+  (ctrl+o to expand)
+
+⏺ Here's the comparison:
+
+  ┌────────────────┬───────┬─────────────┬──────────────┬────────────────┐
+  │                │ Param │             │    VRAM      │                │
+  │     Model      │   s   │   Stages    │ (combined gp │    Best For    │
+  │                │       │             │ u_mem_util)  │                │
+  ├────────────────┼───────┼─────────────┼──────────────┼────────────────┤
+  │ CosyVoice3-0.5 │ 0.5B  │ 2 (talker + │ 0.4 + 0.2 =  │ Absolute       │
+  │ B              │       │  code2wav)  │ 0.6          │ smallest       │
+  ├────────────────┼───────┼─────────────┼──────────────┼────────────────┤
+  │ Qwen3-TTS-1.7B │ 1.7B  │ 2 (tts +    │ 0.3 + 0.3 =  │ Small + well-d │
+  │                │       │ code2wav)   │ 0.6          │ ocumented      │
+  ├────────────────┼───────┼─────────────┼──────────────┼────────────────┤
+  │ Fish Speech S2 │       │ 2 (ar + dac │ 0.4 + 0.2 =  │ Audio,         │
+  │  Pro           │ ~4B   │ _decoder)   │ 0.6          │ slightly       │
+  │                │       │             │              │ larger         │
+  ├────────────────┼───────┼─────────────┼──────────────┼────────────────┤
+  │                │       │             │              │ What we've     │
+  │ BAGEL-7B-MoT   │ 7B+Di │ 2 (thinker  │ 0.45 + 0.45  │ been           │
+  │                │ T     │ + dit)      │ = 0.9        │ documenting,   │
+  │                │       │             │              │ but heavy      │
+  ├────────────────┼───────┼─────────────┼──────────────┼────────────────┤
+  │ Qwen2.5-Omni / │ 3–7B+ │ 3 stages    │ 0.9+         │ Full omni,     │
+  │  Qwen3-Omni    │       │             │              │ needs big GPU  │
+  └────────────────┴───────┴─────────────┴──────────────┴────────────────┘
+
+  My recommendation: BAGEL-7B-MoT — even though it's larger, because:
+
+  1. It's what our entire doc is about — the multi-node architecture, Mooncake
+  connectors, KV cache transfer are all designed around the BAGEL AR→DiT
+  pipeline
+  2. It already has a bagel_multiconnector.yaml with Mooncake wiring — no config
+   work needed
+  3. It's the only model with an existing multi-node config
+  (bagel_multiconnector.yaml). The TTS/audio models only have single-node
+  configs.
+  4. The KV cache transfer (the hardest part of multi-node) is specific to
+  BAGEL's thinker→dit flow
+
+  If VRAM is truly tight (e.g., only 16GB GPUs), then CosyVoice3-0.5B is the
+  smallest, but you'd need to write the multiconnector YAML from scratch and the
+   code2wav stage doesn't use KV cache transfer — so it wouldn't exercise the
+  Mooncake path.
+
+  Practical suggestion: Use BAGEL-7B-MoT with gpu_memory_utilization: 0.45 per
+  stage. On two 24GB GPUs (one per node), each stage gets ~10.8GB which is
+  enough for the 7B thinker and the DiT respectively.
+
+✻ Brewed for 1m 17s
+
+❯ sounds good, let's target BAGEL-7B-MoT.                                       
+                                                                                
+If my design goal is to use stage0 on nodeA, stage1 on nodeB. but I do not have 
+ two machines, only single machine for testing. could I use stag0 on nodeA,     
+stage1 on nodeA for testing? I can still use mooncake kv connector to mock the  
+multi-node case. this is to accelerate the development efficiency.              
+
+⏺ Yes, that's a great approach. Same machine, two separate processes, Mooncake
+  connector between them — exercises the full distributed control plane and data
+   plane without needing two boxes. When you move to real multi-node later, the
+  only change is IP addresses in the YAML.
+
+  ┌─────────────── Single Machine (NodeA) ───────────────────┐
+  │                                                           │
+  │  Process 1                    Process 2                   │
+  │  ┌───────────────────┐       ┌───────────────────┐       │
+  │  │ vllm serve ...    │       │ vllm serve ...    │       │
+  │  │ --stage-id 0      │       │ --stage-id 1      │       │
+  │  │ -oma 127.0.0.1    │       │ -oma 127.0.0.1    │       │
+  │  │ -omp 8091         │       │ -omp 8091         │       │
+  │  │ --port 8000       │       │ (worker mode)     │       │
+  │  │                   │       │                   │       │
+  │  │ API Server ✅     │ ZMQ   │ API Server ❌     │       │
+  │  │ Orchestrator ✅   │◄─────▶│ DiT Engine only   │       │
+  │  │ Thinker Engine    │:8091  │                   │       │
+  │  │ GPU 0             │       │ GPU 1 (or GPU 0)  │       │
+  │  └────────┬──────────┘       └────────┬──────────┘       │
+  │           │                           │                   │
+  │           │    ┌──────────────┐       │                   │
+  │           └───▶│  Mooncake    │◀──────┘                   │
+  │                │  Master      │                           │
+  │                │  127.0.0.1   │                           │
+  │                │  :50051 gRPC │                           │
+  │                │  :8080  HTTP │                           │
+  │                └──────────────┘                           │
+  │                (Process 0 - start first)                  │
+  └───────────────────────────────────────────────────────────┘
+
+  This is actually a good thing to document — let me add a dev testing section
+  to the doc.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(docs/design/feature/bagel_multinode_deployment.md)
+  ⎿  Added 109 lines
+      640  - Failover / health monitoring
+      641  - Dynamic scaling (fixed 1:1 stage-to-node mapping)
+      642  
+      643 +### 7.5 Dev Testing: Single-Machine Two-Process Setup         
+      644 +                                                              
+      645 +You don't need two physical machines to develop and test the d
+          +istributed control plane. Run both stages as **separate proces
+          +ses on the same machine** with Mooncake connectors — this exer
+          +cises the exact same code paths as real multi-node.           
+      646 +                                                              
+      647 +**Why this works:**                                           
+      648 +- Mooncake connector uses TCP even on localhost — same protoco
+          +l as cross-node                                               
+      649 +- ZMQ control plane uses TCP sockets, not IPC — same protocol 
+          +as cross-node                                                 
+      650 +- Each process loads only its own stage (via `--stage-id`) — s
+          +ame isolation as cross-node                                   
+      651 +- The only difference vs. real multi-node is the IP address in
+          + the YAML (`127.0.0.1` → real IPs)                            
+      652 +                                                              
+      653 +**Architecture:**                                             
+      654 +                                                              
+      655 +```                                                           
+      656 +┌──────────────── Single Machine ─────────────────────────┐   
+      657 +│                                                          │  
+      658 +│  Process 0: Mooncake Master (start first)                │  
+      659 +│  ┌────────────────────────────────────────┐              │  
+      660 +│  │ mooncake_master --rpc_port=50051       │              │  
+      661 +│  │   --http_metadata_server_port=8080     │              │  
+      662 +│  └────────────────────────────────────────┘              │  
+      663 +│                                                          │  
+      664 +│  Process 1: Stage 0 (Master)    Process 2: Stage 1       │  
+      665 +│  ┌─────────────────────────┐   ┌────────────────────┐   │   
+      666 +│  │ vllm serve              │   │ vllm serve         │   │   
+      667 +│  │   BAGEL-7B-MoT --omni  │   │   BAGEL-7B-MoT    │   │     
+      668 +│  │   --stage-id 0          │   │   --stage-id 1     │   │   
+      669 +│  │   -oma 127.0.0.1       │   │   -oma 127.0.0.1   │   │    
+      670 +│  │   -omp 8091             │   │   -omp 8091        │   │   
+      671 +│  │   --port 8000           │   │   (worker mode)    │   │   
+      672 +│  │                         │   │                    │   │   
+      673 +│  │ CUDA_VISIBLE_DEVICES=0  │   │ CUDA_VISIBLE_      │   │   
+      674 +│  │                         │   │   DEVICES=1        │   │   
+      675 +│  │ API Server ✅           │   │ API Server ❌      │   │   
+      676 +│  │ Orchestrator ✅         │   │ DiT Engine only    │   │   
+      677 +│  │ Thinker Engine          │   │                    │   │   
+      678 +│  └────────┬────────────────┘   └──────┬─────────────┘   │   
+      679 +│           │      ZMQ :8091      ▲     │                  │  
+      680 +│           │      ◄──────────────┘     │                  │  
+      681 +│           │                           │                  │  
+      682 +│           │   ┌──────────────────┐    │                  │  
+      683 +│           └──▶│ Mooncake Master  │◀───┘                  │  
+      684 +│               │ 127.0.0.1:50051  │                       │  
+      685 +│               └──────────────────┘                       │  
+      686 +└──────────────────────────────────────────────────────────┘  
+      687 +```                                                           
+      688 +                                                              
+      689 +**Startup sequence (3 terminals):**                           
+      690 +                                                              
+      691 +```bash                                                       
+      692 +# Terminal 1: Mooncake Master                                 
+      693 +mooncake_master \                                             
+      694 +  --rpc_port=50051 \                                          
+      695 +  --enable_http_metadata_server=true \                        
+      696 +  --http_metadata_server_host=0.0.0.0 \                       
+      697 +  --http_metadata_server_port=8080                            
+      698 +                                                              
+      699 +# Terminal 2: Stage 0 (Thinker / Master) — wait for Mooncake t
+          +o be ready                                                    
+      700 +CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.ser
+          +ve \                                                          
+      701 +  ByteDance-Seed/BAGEL-7B-MoT --omni \                        
+      702 +  --port 8000 \                                               
+      703 +  --stage-configs-path bagel_multiconnector.yaml \            
+      704 +  --stage-id 0 \                                              
+      705 +  -oma 127.0.0.1 -omp 8091                                    
+      706 +                                                              
+      707 +# Terminal 3: Stage 1 (DiT / Worker) — wait for Stage 0 to be 
+          +ready                                                         
+      708 +CUDA_VISIBLE_DEVICES=1 python -m vllm_omni.entrypoints.cli.ser
+          +ve \                                                          
+      709 +  ByteDance-Seed/BAGEL-7B-MoT --omni \                        
+      710 +  --stage-configs-path bagel_multiconnector.yaml \            
+      711 +  --stage-id 1 \                                              
+      712 +  -oma 127.0.0.1 -omp 8091                                    
+      713 +```                                                           
+      714 +                                                              
+      715 +**Single GPU testing:** If you only have one GPU, both process
+          +es can share it by setting `gpu_memory_utilization: 0.45` for 
+          +each stage (already the default in `bagel_multiconnector.yaml`
+          +). Use the same `CUDA_VISIBLE_DEVICES=0` for both.            
+      716 +                                                              
+      717 +**Stage config for localhost testing** — use `bagel_multiconne
+          +ctor.yaml` as-is, just ensure the Mooncake addresses point to 
+          +`127.0.0.1`:                                                  
+      718 +                                                              
+      719 +```yaml                                                       
+      720 +connectors:                                                   
+      721 +  mooncake_connector:                                         
+      722 +    name: MooncakeStoreConnector                              
+      723 +    extra:                                                    
+      724 +      host: "127.0.0.1"                                       
+      725 +      metadata_server: "http://127.0.0.1:8080/metadata"       
+      726 +      master: "127.0.0.1:50051"                               
+      727 +      segment: 512000000                                      
+      728 +      proto: "tcp"                                            
+      729 +```                                                           
+      730 +                                                              
+      731 +**Test request:**                                             
+      732 +                                                              
+      733 +```bash                                                       
+      734 +curl http://127.0.0.1:8000/v1/chat/completions \              
+      735 +  -H "Content-Type: application/json" \                       
+      736 +  -d '{                                                       
+      737 +    "model": "ByteDance-Seed/BAGEL-7B-MoT",                   
+      738 +    "messages": [{"role": "user", "content": "Generate an imag
+          +e of a cute cat"}]                                            
+      739 +  }'                                                          
+      740 +```                                                           
+      741 +                                                              
+      742 +**What this validates:**                                      
+      743 +- `--stage-id` correctly filters to one stage per process     
+      744 +- Worker mode (no API server on Stage 1) works                
+      745 +- ZMQ control plane connects Stage 0 ↔ Stage 1                
+      746 +- Mooncake KV cache transfer via TCP on localhost             
+      747 +- Orchestrator dispatches to remote stage client              
+      748 +- Output flows back from Stage 1 → Orchestrator → API response
+      749 +                                                              
+      750 +**Transitioning to real multi-node:** Change `127.0.0.1` to ac
+          +tual IPs in the YAML and CLI args. No code changes needed.    
+      751 +                                                              
+      752  ---
+      753  
+      754  ## 8. Approach B: Kubernetes-Native Orchestration
+
+⏺ Done. Added Section 7.5 with the full single-machine two-process dev setup:
+
+  - Architecture diagram showing 3 processes (Mooncake Master + Stage 0 + Stage
+  1) on one machine
+  - Exact startup commands for 3 terminals
+  - Single GPU tip (both stages share GPU 0 with gpu_mem_util: 0.45 each)
+  - YAML config for localhost
+  - Test curl command
+  - Checklist of what this validates
+  - One-liner on how to transition to real multi-node (just change IPs)
+
+  The key insight: the code paths are identical — Mooncake uses TCP even on
+  localhost, ZMQ uses TCP not IPC. The only difference between this and real
+  multi-node is the IP address string.
+
+✻ Sautéed for 1m 0s
+
+❯ If we explicitly use mooncake tcp, but not use sharememory connector. that    
+should be ok?                                                                   
+
+⏺ Yes, totally fine. The connector is just a config choice in the YAML —
+  Mooncake TCP works on localhost the same as cross-node. Using it consistently
+  means:
+
+  1. Same code path in dev and prod — no connector-type mismatch surprises
+  2. SharedMemoryConnector is only an optimization for same-node — it avoids
+  serialization overhead, but for dev/testing the TCP latency on localhost is
+  negligible (~0.1ms)
+  3. The KV cache transfer already uses Mooncake (bagel_multiconnector.yaml
+  wires both output_connectors and omni_kv_config through mooncake_connector)
+
+  The only trade-off:
+
+  ┌─────────────────┬────────────────────────────┬──────────────────────────┐
+  │                 │   SharedMemoryConnector    │ MooncakeStoreConnector   │
+  │                 │                            │          (TCP)           │
+  ├─────────────────┼────────────────────────────┼──────────────────────────┤
+  │ Serialization   │ Skipped for large objects  │ Always                   │
+  │                 │ (direct SHM)               │ serialize/deserialize    │
+  ├─────────────────┼────────────────────────────┼──────────────────────────┤
+  │ Latency         │ ~0.01ms                    │ ~0.1ms                   │
+  │ (localhost)     │                            │                          │
+  ├─────────────────┼────────────────────────────┼──────────────────────────┤
+  │ Extra           │ None                       │ Mooncake Master process  │
+  │ dependency      │                            │                          │
+  ├─────────────────┼────────────────────────────┼──────────────────────────┤
+  │ Matches prod    │ No                         │ Yes                      │
+  │ path            │                            │                          │
+  └─────────────────┴────────────────────────────┴──────────────────────────┘
+
+  For dev testing, matching the prod path is more valuable than saving 0.09ms.
+  Keep Mooncake TCP everywhere — it's one less variable when debugging.
+
+  The bagel_multiconnector.yaml already does this (no SharedMemoryConnector
+  configured), so you don't need to change anything.
