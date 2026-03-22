@@ -221,10 +221,31 @@ class AsyncOmniEngine:
             ea_dict.pop("model", None)
             kwargs = {**ea_dict, **kwargs}
 
+        # Extract cross-node deployment args before they pollute downstream code.
+        self._stage_id: int | None = kwargs.pop("stage_id", None)
+        self._worker_address: str | None = kwargs.get("omni_master_address")
+        self._worker_port: int | None = kwargs.get("omni_master_port")
+
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
-        self.num_stages = len(self.stage_configs)
-        stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
+        # Keep full pipeline config for topology awareness (remote stages).
+        self._all_stage_configs = list(self.stage_configs)
+
+        # When --stage-id is set, filter to only the local stage for init,
+        # but keep num_stages as the full pipeline length so the Orchestrator
+        # knows about all stages (including remote ones).
+        if self._stage_id is not None:
+            self.stage_configs = [
+                cfg for cfg in self.stage_configs if getattr(cfg, "stage_id", None) == self._stage_id
+            ]
+            if not self.stage_configs:
+                raise ValueError(
+                    f"--stage-id {self._stage_id} not found in stage configs. "
+                    f"Available: {[getattr(c, 'stage_id', i) for i, c in enumerate(self._all_stage_configs)]}"
+                )
+
+        self.num_stages = len(self._all_stage_configs)
+        stage0_args = getattr(self._all_stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
         self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
         self.stage_clients: list[Any] = []
         self.stage_vllm_configs: list[Any] = []
@@ -439,9 +460,13 @@ class AsyncOmniEngine:
 
         async_chunk = self.async_chunk
         prompt_expand_func = None
+        # Count local LLM stages only (filtered by --stage-id)
         llm_stage_count = sum(
             1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") != "diffusion"
         )
+
+        # Build set of local stage IDs for filtering
+        local_stage_ids = {getattr(cfg, "stage_id", i) for i, cfg in enumerate(self.stage_configs)}
 
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self.model, self.config_path)
@@ -451,7 +476,33 @@ class AsyncOmniEngine:
                 max_workers=max(1, llm_stage_count),
                 thread_name_prefix="llm-stage-launch",
             ) as launch_executor:
-                for stage_id, stage_cfg in enumerate(self.stage_configs):
+                for stage_id, stage_cfg in enumerate(self._all_stage_configs):
+                    cfg_stage_id = getattr(stage_cfg, "stage_id", stage_id)
+
+                    # Remote stage — create proxy client instead of initializing locally
+                    if self._stage_id is not None and cfg_stage_id not in local_stage_ids:
+                        metadata = extract_stage_metadata(stage_cfg)
+                        if metadata.stage_type == "diffusion":
+                            from vllm_omni.engine.remote_stage_client import RemoteDiffusionClient
+
+                            worker_addr = self._worker_address or "127.0.0.1"
+                            worker_port = self._worker_port or 8091
+                            stage_clients[stage_id] = RemoteDiffusionClient(
+                                worker_addr, worker_port, metadata
+                            )
+                            logger.info(
+                                "[AsyncOmniEngine] Stage %s configured as remote (worker at %s:%d)",
+                                stage_id,
+                                worker_addr,
+                                worker_port,
+                            )
+                        else:
+                            logger.warning(
+                                "[AsyncOmniEngine] Remote LLM stages not yet supported (stage %s)",
+                                stage_id,
+                            )
+                        continue
+
                     logger.info("[AsyncOmniEngine] Initializing stage %s", stage_id)
                     metadata = extract_stage_metadata(stage_cfg)
                     if metadata.prompt_expand_func is not None:
@@ -558,6 +609,14 @@ class AsyncOmniEngine:
             self._initialize_janus_queues()
 
             self._initialize_stages(stage_init_timeout)
+
+            # Start recv loops for any remote stage clients
+            from vllm_omni.engine.remote_stage_client import RemoteDiffusionClient
+
+            for client in self.stage_clients:
+                if isinstance(client, RemoteDiffusionClient):
+                    client.start(asyncio.get_running_loop())
+
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
                 output_async_queue=self.output_queue.async_q,

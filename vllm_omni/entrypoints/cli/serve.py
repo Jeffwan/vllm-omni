@@ -168,13 +168,14 @@ class OmniServeCommand(CLISubcommand):
             "--omni-master-address",
             "-oma",
             type=str,
-            help="Hostname or IP address of the Omni orchestrator (master).",
+            help="Hostname or IP address for the worker ZMQ server to bind on, "
+            "or the address the master connects to.",
         )
         omni_config_group.add_argument(
             "--omni-master-port",
             "-omp",
             type=int,
-            help="Port of the Omni orchestrator (master).",
+            help="Port for the worker ZMQ server (worker binds, master connects).",
         )
 
         # Diffusion model specific arguments
@@ -373,22 +374,101 @@ def _create_default_diffusion_stage_cfg(args: argparse.Namespace) -> list[dict[s
 
 
 def run_headless(args: argparse.Namespace) -> None:
-    """Run a single stage in headless mode.
+    """Run a single stage in worker mode (no API server).
 
-    .. deprecated:: 0.x.x
-        Headless mode is deprecated and will be removed in a future version.
-        It is only compatible with the old OmniStage-based runtime.
-        The current AsyncOmniEngine-based runtime does not support headless mode.
+    Starts only the selected stage's engine and a ZMQ server that accepts
+    requests from the master node's Orchestrator. Used for cross-node
+    distributed deployment.
 
-    Raises:
-        RuntimeError: Always raises an error indicating headless mode is deprecated.
+    Requires: --stage-id, -oma, -omp
     """
-    raise RuntimeError(
-        "Headless mode is deprecated and not supported in the current runtime. "
-        "Please use the standard orchestrator mode (without --headless flag). "
-        "If you need distributed deployment, consider using Ray backend or "
-        "other distributed serving solutions."
+    uvloop.run(_run_worker_stage(args))
+
+
+async def _run_worker_stage(args: argparse.Namespace) -> None:
+    """Async worker stage entry point."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        resolve_omni_kv_config_for_stage,
     )
+    from vllm_omni.engine.stage_init_utils import (
+        extract_stage_metadata,
+        initialize_diffusion_stage,
+        load_omni_transfer_config_for_model,
+        prepare_engine_environment,
+        setup_stage_devices,
+    )
+    from vllm_omni.engine.worker_stage_server import WorkerStageServer
+    from vllm_omni.entrypoints.utils import inject_omni_kv_config, load_and_resolve_stage_configs
+
+    stage_id = args.stage_id
+    if stage_id is None:
+        raise ValueError("--headless requires --stage-id to be set")
+
+    model = getattr(args, "model_tag", None) or getattr(args, "model", None)
+    if not model:
+        raise ValueError("--headless requires a model to be specified")
+
+    bind_host = args.omni_master_address or "0.0.0.0"
+    bind_port = args.omni_master_port or 8091
+
+    kwargs = vars(args).copy()
+    kwargs.pop("model", None)
+    kwargs.pop("model_tag", None)
+
+    # Load all stage configs and pick the selected one
+    stage_configs_path = kwargs.get("stage_configs_path")
+    config_path, all_stage_configs = load_and_resolve_stage_configs(
+        model, stage_configs_path, kwargs
+    )
+
+    stage_cfg = None
+    for cfg in all_stage_configs:
+        if getattr(cfg, "stage_id", None) == stage_id:
+            stage_cfg = cfg
+            break
+    if stage_cfg is None:
+        available = [getattr(c, "stage_id", i) for i, c in enumerate(all_stage_configs)]
+        raise ValueError(f"--stage-id {stage_id} not found. Available: {available}")
+
+    metadata = extract_stage_metadata(stage_cfg)
+
+    if metadata.stage_type != "diffusion":
+        raise ValueError(
+            f"Worker mode currently only supports diffusion stages, "
+            f"but stage {stage_id} is type '{metadata.stage_type}'"
+        )
+
+    # Prepare environment and KV transfer config
+    prepare_engine_environment()
+    omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
+    omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
+    omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+    if omni_conn_cfg:
+        inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
+
+    # Inject stage_id and engine_input_source into omni_kv_config
+    from vllm_omni.engine.async_omni_engine import _inject_kv_stage_info
+
+    _inject_kv_stage_info(stage_cfg, stage_id)
+
+    # Setup GPU devices for this stage
+    setup_stage_devices(stage_id, metadata.runtime_cfg)
+
+    # Initialize the local diffusion stage
+    logger.info("[Worker] Initializing diffusion stage %d...", stage_id)
+    stage_client = initialize_diffusion_stage(model, stage_cfg, metadata)
+    logger.info("[Worker] Diffusion stage %d initialized", stage_id)
+
+    # Start ZMQ server and serve requests
+    server = WorkerStageServer(bind_host, bind_port, stage_client)
+    logger.info(
+        "[Worker] Stage %d listening on tcp://%s:%d (responses on :%d)",
+        stage_id,
+        bind_host,
+        bind_port,
+        bind_port + 1,
+    )
+    await server.run()
 
 
 def cmd_init() -> list[CLISubcommand]:
